@@ -8,14 +8,17 @@
  *
  * Architecture:
  *   - LOAD:    Accept N input samples, store bit-reversed in BRAM
- *   - COMPUTE: LOG2N stages x N/2 butterflies, 5-cycle pipeline:
+ *   - COMPUTE: LOG2N stages x N/2 butterflies, 4-cycle pipeline:
  *              BF_READ:  Present BRAM addresses; register twiddle index
  *              BF_TW:    BRAM data valid → capture; twiddle ROM lookup from
  *                        registered index → capture cos/sin
- *              BF_MULT2: DSP multiply from registered data + twiddle
- *              BF_SHIFT: Arithmetic shift of DSP products
- *              BF_WRITE: Add/subtract + BRAM writeback
+ *              BF_MULT2: DSP multiply from registered data + twiddle → PREG
+ *              BF_WRITE: Shift (bit-select from PREG, pure wiring) +
+ *                        add/subtract + BRAM writeback
  *   - OUTPUT:  Stream N results (1/N scaling for IFFT)
+ *
+ * Twiddle index computed via barrel shift (idx << (LOG2N-1-stage)) instead
+ * of general multiply, since the stride is always a power of 2.
  *
  * Data memory uses xpm_memory_tdpram (Xilinx Parameterized Macros) for
  * guaranteed BRAM mapping in synthesis.  Under `ifdef SIMULATION, a
@@ -67,23 +70,20 @@ localparam [LOG2N:0] FFT_N_M1      = N - 1;
 // ============================================================================
 // STATES
 // ============================================================================
-// Butterfly pipeline: READ → TW → MULT2 → SHIFT → WRITE (5 cycles)
+// Butterfly pipeline: READ → TW → MULT2 → WRITE (4 cycles)
 //   READ:  Present BRAM addresses; register twiddle index (bf_tw_idx)
-//   TW:    BRAM data valid → capture rd_a/rd_b; ROM lookup from registered
-//          twiddle index → capture rd_tw_cos/sin. This splits the combinational
-//          path (address calc + multiply + ROM + quarter-wave mux) into two cycles.
-//   MULT2: DSP multiply from registered data
-//   SHIFT: Arithmetic shift of DSP products
-//   WRITE: Add/subtract + BRAM writeback
+//   TW:    BRAM data valid → capture rd_a/rd_b; twiddle ROM lookup from
+//          registered index → capture cos/sin
+//   MULT2: DSP multiply from registered data + twiddle → products in PREG
+//   WRITE: Shift (bit-select from PREG, pure wiring) + add/sub + BRAM writeback
 localparam [3:0] ST_IDLE     = 4'd0,
                  ST_LOAD     = 4'd1,
                  ST_BF_READ  = 4'd2,
                  ST_BF_TW    = 4'd3,
                  ST_BF_MULT2 = 4'd4,
-                 ST_BF_SHIFT = 4'd5,
-                 ST_BF_WRITE = 4'd6,
-                 ST_OUTPUT   = 4'd7,
-                 ST_DONE     = 4'd8;
+                 ST_BF_WRITE = 4'd5,
+                 ST_OUTPUT   = 4'd6,
+                 ST_DONE     = 4'd7;
 
 reg [3:0] state;
 assign busy = (state != ST_IDLE);
@@ -135,9 +135,8 @@ reg [LOG2N-1:0] rd_addr_even, rd_addr_odd;
 reg rd_inverse;
 reg [LOG2N-1:0] rd_tw_idx;  // registered twiddle index (breaks addr→ROM path)
 
-// Half and twiddle stride
+// Half register (twiddle stride replaced by barrel shift — see bf_addr_calc)
 reg [LOG2N-1:0] half_reg;
-reg [LOG2N-1:0] tw_stride_reg;
 
 // ============================================================================
 // BUTTERFLY ADDRESS COMPUTATION (combinational)
@@ -158,7 +157,7 @@ always @(*) begin : bf_addr_calc
     bf_addr_even = (grp_val << 1) | idx_val;
     bf_addr_odd  = bf_addr_even + half_val;
 
-    bf_tw_idx = idx_val * tw_stride_reg;
+    bf_tw_idx = idx_val << (LOG2N - 1 - stage);
 end
 
 // ============================================================================
@@ -215,13 +214,12 @@ endfunction
 // ============================================================================
 // BUTTERFLY PIPELINE REGISTERS
 // ============================================================================
-// Stage 1 (BF_MULT):  Capture BRAM read data into rd_a, rd_b
+// Stage 1 (BF_TW):    Capture BRAM read data into rd_a, rd_b
 // Stage 2 (BF_MULT2): DSP multiply + accumulate → raw products (bf_prod_re/im)
-// Stage 3 (BF_WRITE): Shift (bit-select) + add/subtract + BRAM writeback
+// Stage 3 (BF_WRITE): Shift (bit-select, pure wiring) + add/subtract + BRAM writeback
 // ============================================================================
 reg signed [INTERNAL_W-1:0] rd_a_re, rd_a_im;    // registered BRAM port A data
 reg signed [INTERNAL_W-1:0] rd_b_re, rd_b_im;    // registered BRAM port B data (for twiddle multiply)
-reg signed [INTERNAL_W-1:0] bf_t_re, bf_t_im;    // twiddle products (after shift)
 
 // Raw DSP products — full precision, registered to break DSP→CARRY4 path
 // Width: 32*16 = 48 bits per multiply, sum of two = 49 bits max
@@ -233,10 +231,12 @@ reg signed [INTERNAL_W-1:0] bf_sum_re, bf_sum_im;
 reg signed [INTERNAL_W-1:0] bf_dif_re, bf_dif_im;
 
 always @(*) begin : bf_addsub
-    bf_sum_re = rd_a_re + bf_t_re;
-    bf_sum_im = rd_a_im + bf_t_im;
-    bf_dif_re = rd_a_re - bf_t_re;
-    bf_dif_im = rd_a_im - bf_t_im;
+    // Shift is pure bit-selection from DSP PREG (zero logic levels in HW).
+    // Path: PREG → wiring → 32-bit CARRY4 adder → BRAM write (~3 ns total).
+    bf_sum_re = rd_a_re + (bf_prod_re >>> (TWIDDLE_W - 1));
+    bf_sum_im = rd_a_im + (bf_prod_im >>> (TWIDDLE_W - 1));
+    bf_dif_re = rd_a_re - (bf_prod_re >>> (TWIDDLE_W - 1));
+    bf_dif_im = rd_a_im - (bf_prod_im >>> (TWIDDLE_W - 1));
 end
 
 // ============================================================================
@@ -286,10 +286,6 @@ always @(*) begin : bram_port_mux
     end
     ST_BF_MULT2: begin
         // Twiddle multiply from registered BRAM data (rd_b_re/im)
-        // No BRAM access needed this cycle
-    end
-    ST_BF_SHIFT: begin
-        // Shift (bit-select) from registered DSP products
         // No BRAM access needed this cycle
     end
     ST_BF_WRITE: begin
@@ -547,7 +543,6 @@ always @(posedge clk or negedge reset_n) begin
         bfly_count     <= 0;
         stage          <= 0;
         half_reg       <= 1;
-        tw_stride_reg  <= FFT_N_HALF[LOG2N-1:0];
         dout_re        <= 0;
         dout_im        <= 0;
         dout_valid     <= 0;
@@ -572,7 +567,6 @@ always @(posedge clk or negedge reset_n) begin
                     stage         <= 0;
                     bfly_count    <= 0;
                     half_reg      <= 1;
-                    tw_stride_reg <= FFT_N_HALF[LOG2N-1:0];
                 end else begin
                     load_count <= load_count + 1;
                 end
@@ -588,10 +582,6 @@ always @(posedge clk or negedge reset_n) begin
         end
 
         ST_BF_MULT2: begin
-            state <= ST_BF_SHIFT;
-        end
-
-        ST_BF_SHIFT: begin
             state <= ST_BF_WRITE;
         end
 
@@ -604,7 +594,6 @@ always @(posedge clk or negedge reset_n) begin
                 end else begin
                     stage         <= stage + 1;
                     half_reg      <= half_reg << 1;
-                    tw_stride_reg <= tw_stride_reg >> 1;
                     state         <= ST_BF_READ;
                 end
             end else begin
@@ -652,8 +641,8 @@ end
 //   - rd_tw_cos/sin  → DSP48E1 BREG (butterfly multiply B-port input)
 //   - bf_prod_re/im  → DSP48E1 PREG (multiply output register)
 //   - rd_a_re/im     → BRAM output register (REGCE)
-//   - rd_tw_idx      → DSP48E1 PREG (twiddle index multiply output)
-//   - bf_t_re/im, rd_addr_even/odd, rd_inverse — internal pipeline
+//   - rd_tw_idx      → pipeline register (twiddle index)
+//   - rd_addr_even/odd, rd_inverse — internal pipeline
 //
 // These registers are only meaningful during COMPUTE states (BF_READ through
 // BF_WRITE). Their values are always overwritten before use after every FSM
@@ -671,8 +660,6 @@ always @(posedge clk) begin
         rd_a_im        <= 0;
         rd_b_re        <= 0;
         rd_b_im        <= 0;
-        bf_t_re        <= 0;
-        bf_t_im        <= 0;
         bf_prod_re     <= 0;
         bf_prod_im     <= 0;
     end else begin
@@ -705,9 +692,9 @@ always @(posedge clk) begin
 
         ST_BF_MULT2: begin
             // Compute raw twiddle products from registered BRAM data.
-            // Path: register -> DSP48E1 multiply-accumulate -> register
-            // The shift is deferred to the next cycle to break the
-            // DSP -> CARRY4 path.
+            // Path: register -> DSP48E1 multiply-accumulate -> PREG
+            // The arithmetic shift and add/subtract are handled combinationally
+            // in BF_WRITE (shift is pure bit-select, zero logic levels).
             if (!rd_inverse) begin
                 bf_prod_re <= rd_b_re * rd_tw_cos + rd_b_im * rd_tw_sin;
                 bf_prod_im <= rd_b_im * rd_tw_cos - rd_b_re * rd_tw_sin;
@@ -715,14 +702,6 @@ always @(posedge clk) begin
                 bf_prod_re <= rd_b_re * rd_tw_cos - rd_b_im * rd_tw_sin;
                 bf_prod_im <= rd_b_im * rd_tw_cos + rd_b_re * rd_tw_sin;
             end
-        end
-
-        ST_BF_SHIFT: begin
-            // Apply arithmetic right shift to registered DSP products.
-            // Register -> bit-select/sign-extend -> register
-            // (near-zero logic: pure wiring + sign extension).
-            bf_t_re <= bf_prod_re >>> (TWIDDLE_W - 1);
-            bf_t_im <= bf_prod_im >>> (TWIDDLE_W - 1);
         end
 
         default: begin
