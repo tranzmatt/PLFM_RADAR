@@ -66,7 +66,7 @@ TEST_NAMES = {
 class SmokeTest:
     """Host-side smoke test controller."""
 
-    def __init__(self, connection: FT2232HConnection, adc_dump_path: str = None):
+    def __init__(self, connection: FT2232HConnection, adc_dump_path: str | None = None):
         self.conn = connection
         self.adc_dump_path = adc_dump_path
         self._adc_samples = []
@@ -82,10 +82,9 @@ class SmokeTest:
         log.info("")
 
         # Step 1: Connect
-        if not self.conn.is_open:
-            if not self.conn.open():
-                log.error("Failed to open FT2232H connection")
-                return False
+        if not self.conn.is_open and not self.conn.open():
+            log.error("Failed to open FT2232H connection")
+            return False
 
         # Step 2: Send self-test trigger (opcode 0x30)
         log.info("Sending self-test trigger (opcode 0x30)...")
@@ -188,10 +187,9 @@ class SmokeTest:
 
     def _save_adc_dump(self):
         """Save captured ADC samples to numpy file."""
-        if not self._adc_samples:
+        if not self._adc_samples and self.conn._mock:
             # In mock mode, generate synthetic ADC data
-            if self.conn._mock:
-                self._adc_samples = list(np.random.randint(0, 65536, 256, dtype=np.uint16))
+            self._adc_samples = list(np.random.randint(0, 65536, 256, dtype=np.uint16))
 
         if self._adc_samples:
             arr = np.array(self._adc_samples, dtype=np.uint16)

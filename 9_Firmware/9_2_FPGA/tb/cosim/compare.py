@@ -93,7 +93,7 @@ SCENARIOS = {
 def load_adc_hex(filepath):
     """Load 8-bit unsigned ADC samples from hex file."""
     samples = []
-    with open(filepath, 'r') as f:
+    with open(filepath) as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith('//'):
@@ -106,7 +106,7 @@ def load_rtl_csv(filepath):
     """Load RTL baseband output CSV (sample_idx, baseband_i, baseband_q)."""
     bb_i = []
     bb_q = []
-    with open(filepath, 'r') as f:
+    with open(filepath) as f:
         f.readline()  # Skip header
         for line in f:
             line = line.strip()
@@ -125,7 +125,6 @@ def run_python_model(adc_samples):
     because the RTL testbench captures the FIR output directly
     (baseband_i_reg <= fir_i_out in ddc_400m.v).
     """
-    print("  Running Python model...")
 
     chain = SignalChain()
     result = chain.process_adc_block(adc_samples)
@@ -135,7 +134,6 @@ def run_python_model(adc_samples):
     bb_i = result['fir_i_raw']
     bb_q = result['fir_q_raw']
 
-    print(f"  Python model: {len(bb_i)} baseband I, {len(bb_q)} baseband Q outputs")
     return bb_i, bb_q
 
 
@@ -145,7 +143,7 @@ def compute_rms_error(a, b):
         raise ValueError(f"Length mismatch: {len(a)} vs {len(b)}")
     if len(a) == 0:
         return 0.0
-    sum_sq = sum((x - y) ** 2 for x, y in zip(a, b))
+    sum_sq = sum((x - y) ** 2 for x, y in zip(a, b, strict=False))
     return math.sqrt(sum_sq / len(a))
 
 
@@ -153,7 +151,7 @@ def compute_max_abs_error(a, b):
     """Compute maximum absolute error between two equal-length lists."""
     if len(a) != len(b) or len(a) == 0:
         return 0
-    return max(abs(x - y) for x, y in zip(a, b))
+    return max(abs(x - y) for x, y in zip(a, b, strict=False))
 
 
 def compute_correlation(a, b):
@@ -235,44 +233,29 @@ def compute_signal_stats(samples):
 def compare_scenario(scenario_name):
     """Run comparison for one scenario. Returns True if passed."""
     if scenario_name not in SCENARIOS:
-        print(f"ERROR: Unknown scenario '{scenario_name}'")
-        print(f"Available: {', '.join(SCENARIOS.keys())}")
         return False
 
     cfg = SCENARIOS[scenario_name]
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    print("=" * 60)
-    print(f"Co-simulation Comparison: {cfg['description']}")
-    print(f"Scenario: {scenario_name}")
-    print("=" * 60)
 
     # ---- Load ADC data ----
     adc_path = os.path.join(base_dir, cfg['adc_hex'])
     if not os.path.exists(adc_path):
-        print(f"ERROR: ADC hex file not found: {adc_path}")
-        print("Run radar_scene.py first to generate test vectors.")
         return False
     adc_samples = load_adc_hex(adc_path)
-    print(f"\nADC samples loaded: {len(adc_samples)}")
 
     # ---- Load RTL output ----
     rtl_path = os.path.join(base_dir, cfg['rtl_csv'])
     if not os.path.exists(rtl_path):
-        print(f"ERROR: RTL CSV not found: {rtl_path}")
-        print("Run the RTL simulation first:")
-        print(f"  iverilog -g2001 -DSIMULATION -DSCENARIO_{scenario_name.upper()} ...")
         return False
     rtl_i, rtl_q = load_rtl_csv(rtl_path)
-    print(f"RTL outputs loaded: {len(rtl_i)} I, {len(rtl_q)} Q samples")
 
     # ---- Run Python model ----
     py_i, py_q = run_python_model(adc_samples)
 
     # ---- Length comparison ----
-    print(f"\nOutput lengths: RTL={len(rtl_i)}, Python={len(py_i)}")
     len_diff = abs(len(rtl_i) - len(py_i))
-    print(f"Length difference: {len_diff} samples")
 
     # ---- Signal statistics ----
     rtl_i_stats = compute_signal_stats(rtl_i)
@@ -280,20 +263,10 @@ def compare_scenario(scenario_name):
     py_i_stats = compute_signal_stats(py_i)
     py_q_stats = compute_signal_stats(py_q)
 
-    print("\nSignal Statistics:")
-    print(f"  RTL I: mean={rtl_i_stats['mean']:.1f}, rms={rtl_i_stats['rms']:.1f}, "
-          f"range=[{rtl_i_stats['min']}, {rtl_i_stats['max']}]")
-    print(f"  RTL Q: mean={rtl_q_stats['mean']:.1f}, rms={rtl_q_stats['rms']:.1f}, "
-          f"range=[{rtl_q_stats['min']}, {rtl_q_stats['max']}]")
-    print(f"  Py  I: mean={py_i_stats['mean']:.1f}, rms={py_i_stats['rms']:.1f}, "
-          f"range=[{py_i_stats['min']}, {py_i_stats['max']}]")
-    print(f"  Py  Q: mean={py_q_stats['mean']:.1f}, rms={py_q_stats['rms']:.1f}, "
-          f"range=[{py_q_stats['min']}, {py_q_stats['max']}]")
 
     # ---- Trim to common length ----
     common_len = min(len(rtl_i), len(py_i))
     if common_len < 10:
-        print(f"ERROR: Too few common samples ({common_len})")
         return False
 
     rtl_i_trim = rtl_i[:common_len]
@@ -302,18 +275,14 @@ def compare_scenario(scenario_name):
     py_q_trim = py_q[:common_len]
 
     # ---- Cross-correlation to find latency offset ----
-    print(f"\nLatency alignment (cross-correlation, max lag=±{MAX_LATENCY_DRIFT}):")
-    lag_i, corr_i = cross_correlate_lag(rtl_i_trim, py_i_trim,
+    lag_i, _corr_i = cross_correlate_lag(rtl_i_trim, py_i_trim,
                                         max_lag=MAX_LATENCY_DRIFT)
-    lag_q, corr_q = cross_correlate_lag(rtl_q_trim, py_q_trim,
+    lag_q, _corr_q = cross_correlate_lag(rtl_q_trim, py_q_trim,
                                         max_lag=MAX_LATENCY_DRIFT)
-    print(f"  I-channel: best lag={lag_i}, correlation={corr_i:.6f}")
-    print(f"  Q-channel: best lag={lag_q}, correlation={corr_q:.6f}")
 
     # ---- Apply latency correction ----
     best_lag = lag_i  # Use I-channel lag (should be same as Q)
     if abs(lag_i - lag_q) > 1:
-        print(f"  WARNING: I and Q latency offsets differ ({lag_i} vs {lag_q})")
         # Use the average
         best_lag = (lag_i + lag_q) // 2
 
@@ -341,32 +310,20 @@ def compare_scenario(scenario_name):
     aligned_py_i = aligned_py_i[:aligned_len]
     aligned_py_q = aligned_py_q[:aligned_len]
 
-    print(f"  Applied lag correction: {best_lag} samples")
-    print(f"  Aligned length: {aligned_len} samples")
 
     # ---- Error metrics (after alignment) ----
     rms_i = compute_rms_error(aligned_rtl_i, aligned_py_i)
     rms_q = compute_rms_error(aligned_rtl_q, aligned_py_q)
-    max_err_i = compute_max_abs_error(aligned_rtl_i, aligned_py_i)
-    max_err_q = compute_max_abs_error(aligned_rtl_q, aligned_py_q)
+    compute_max_abs_error(aligned_rtl_i, aligned_py_i)
+    compute_max_abs_error(aligned_rtl_q, aligned_py_q)
     corr_i_aligned = compute_correlation(aligned_rtl_i, aligned_py_i)
     corr_q_aligned = compute_correlation(aligned_rtl_q, aligned_py_q)
 
-    print("\nError Metrics (after alignment):")
-    print(f"  I-channel: RMS={rms_i:.2f} LSB, max={max_err_i} LSB, corr={corr_i_aligned:.6f}")
-    print(f"  Q-channel: RMS={rms_q:.2f} LSB, max={max_err_q} LSB, corr={corr_q_aligned:.6f}")
 
     # ---- First/last sample comparison ----
-    print("\nFirst 10 samples (after alignment):")
-    print(
-        f"  {'idx':>4s}  {'RTL_I':>8s}  {'Py_I':>8s}  {'Err_I':>6s}  "
-        f"{'RTL_Q':>8s}  {'Py_Q':>8s}  {'Err_Q':>6s}"
-    )
     for k in range(min(10, aligned_len)):
         ei = aligned_rtl_i[k] - aligned_py_i[k]
         eq = aligned_rtl_q[k] - aligned_py_q[k]
-        print(f"  {k:4d}  {aligned_rtl_i[k]:8d}  {aligned_py_i[k]:8d}  {ei:6d}  "
-              f"{aligned_rtl_q[k]:8d}  {aligned_py_q[k]:8d}  {eq:6d}")
 
     # ---- Write detailed comparison CSV ----
     compare_csv_path = os.path.join(base_dir, f"compare_{scenario_name}.csv")
@@ -377,7 +334,6 @@ def compare_scenario(scenario_name):
             eq = aligned_rtl_q[k] - aligned_py_q[k]
             f.write(f"{k},{aligned_rtl_i[k]},{aligned_py_i[k]},{ei},"
                     f"{aligned_rtl_q[k]},{aligned_py_q[k]},{eq}\n")
-    print(f"\nDetailed comparison written to: {compare_csv_path}")
 
     # ---- Pass/Fail ----
     max_rms = cfg.get('max_rms', MAX_RMS_ERROR_LSB)
@@ -443,21 +399,15 @@ def compare_scenario(scenario_name):
                      f"|{best_lag}| <= {MAX_LATENCY_DRIFT}"))
 
     # ---- Report ----
-    print(f"\n{'─' * 60}")
-    print("PASS/FAIL Results:")
     all_pass = True
-    for name, ok, detail in results:
-        mark = "[PASS]" if ok else "[FAIL]"
-        print(f"  {mark} {name}: {detail}")
+    for _name, ok, _detail in results:
         if not ok:
             all_pass = False
 
-    print(f"\n{'=' * 60}")
     if all_pass:
-        print(f"SCENARIO {scenario_name.upper()}: ALL CHECKS PASSED")
+        pass
     else:
-        print(f"SCENARIO {scenario_name.upper()}: SOME CHECKS FAILED")
-    print(f"{'=' * 60}")
+        pass
 
     return all_pass
 
@@ -481,25 +431,18 @@ def main():
                         pass_count += 1
                     else:
                         overall_pass = False
-                    print()
                 else:
-                    print(f"Skipping {name}: RTL CSV not found ({cfg['rtl_csv']})")
+                    pass
 
-            print("=" * 60)
-            print(f"OVERALL: {pass_count}/{run_count} scenarios passed")
             if overall_pass:
-                print("ALL SCENARIOS PASSED")
+                pass
             else:
-                print("SOME SCENARIOS FAILED")
-            print("=" * 60)
+                pass
             return 0 if overall_pass else 1
-        else:
-            ok = compare_scenario(scenario)
-            return 0 if ok else 1
-    else:
-        # Default: DC
-        ok = compare_scenario('dc')
+        ok = compare_scenario(scenario)
         return 0 if ok else 1
+    ok = compare_scenario('dc')
+    return 0 if ok else 1
 
 
 if __name__ == '__main__':

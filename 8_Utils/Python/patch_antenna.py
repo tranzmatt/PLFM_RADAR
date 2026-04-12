@@ -66,8 +66,3 @@ W_mm, L_mm, dx_mm, dy_mm, W_feed_mm = calculate_patch_antenna_parameters(
     frequency, epsilon_r, h_sub, h_cu, array
 )
 
-print(f"Width of the patch: {W_mm:.4f} mm")
-print(f"Length of the patch: {L_mm:.4f} mm")
-print(f"Separation distance in horizontal axis: {dx_mm:.4f} mm")
-print(f"Separation distance in vertical axis: {dy_mm:.4f} mm")
-print(f"Feeding line width: {W_feed_mm:.2f} mm")

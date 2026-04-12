@@ -54,13 +54,6 @@ except ImportError:
     FILTERPY_AVAILABLE = False
     logging.warning("filterpy not available. Kalman tracking will be disabled.")
 
-try:
-    import crcmod as _crcmod  # noqa: F401 — availability check
-    CRCMOD_AVAILABLE = True
-except ImportError:
-    CRCMOD_AVAILABLE = False
-    logging.warning("crcmod not available. CRC validation will use fallback.")
-
 # ---------------------------------------------------------------------------
 # Dark theme color constants (shared by all modules)
 # ---------------------------------------------------------------------------
@@ -105,15 +98,19 @@ class RadarTarget:
 
 @dataclass
 class RadarSettings:
-    """Radar system configuration parameters."""
-    system_frequency: float = 10e9      # Hz
-    chirp_duration_1: float = 30e-6     # Long chirp duration (s)
-    chirp_duration_2: float = 0.5e-6    # Short chirp duration (s)
-    chirps_per_position: int = 32
-    freq_min: float = 10e6              # Hz
-    freq_max: float = 30e6              # Hz
-    prf1: float = 1000                  # PRF 1 (Hz)
-    prf2: float = 2000                  # PRF 2 (Hz)
+    """Radar system display/map configuration.
+
+    FPGA register parameters (chirp timing, CFAR, MTI, gain, etc.) are
+    controlled directly via 4-byte opcode commands — see the FPGA Control
+    tab and Opcode enum in radar_protocol.py.  This dataclass holds only
+    host-side display/map settings and physical-unit conversion factors.
+
+    range_resolution and velocity_resolution should be calibrated to
+    the actual waveform parameters.
+    """
+    system_frequency: float = 10e9      # Hz (carrier, used for velocity calc)
+    range_resolution: float = 781.25    # Meters per range bin (default: 50km/64)
+    velocity_resolution: float = 1.0    # m/s per Doppler bin (calibrate to waveform)
     max_distance: float = 50000         # Max detection range (m)
     map_size: float = 50000             # Map display size (m)
     coverage_radius: float = 50000      # Map coverage radius (m)
@@ -139,10 +136,14 @@ class GPSData:
 
 @dataclass
 class ProcessingConfig:
-    """Signal processing pipeline configuration.
+    """Host-side signal processing pipeline configuration.
 
-    Controls: MTI filter, CFAR detector, DC notch removal,
-    windowing, detection threshold, DBSCAN clustering, and Kalman tracking.
+    These control host-side DSP that runs AFTER the FPGA processing
+    pipeline.  FPGA-side MTI, CFAR, and DC notch are controlled via
+    register opcodes from the FPGA Control tab.
+
+    Controls: DBSCAN clustering, Kalman tracking, and optional
+    host-side reprocessing (MTI, CFAR, windowing, DC notch).
     """
 
     # MTI (Moving Target Indication)

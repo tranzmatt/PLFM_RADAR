@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 """
 Radar System GUI - Fully Functional Demo Version
@@ -15,7 +14,6 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import logging
 from dataclasses import dataclass
-from typing import List, Dict
 import random
 import json
 from datetime import datetime
@@ -65,7 +63,7 @@ class SimulatedRadarProcessor:
         self.noise_floor = 10
         self.clutter_level = 5
         
-    def _create_targets(self) -> List[Dict]:
+    def _create_targets(self) -> list[dict]:
         """Create moving targets"""
         return [
             {
@@ -210,22 +208,20 @@ class SimulatedRadarProcessor:
         
         return rd_map
     
-    def _detect_targets(self) -> List[RadarTarget]:
+    def _detect_targets(self) -> list[RadarTarget]:
         """Detect targets from current state"""
-        detected = []
-        for t in self.targets:
-            # Random detection based on SNR
-            if random.random() < (t['snr'] / 35):
-                # Add some measurement noise
-                detected.append(RadarTarget(
-                    id=t['id'],
-                    range=t['range'] + random.gauss(0, 10),
-                    velocity=t['velocity'] + random.gauss(0, 2),
-                    azimuth=t['azimuth'] + random.gauss(0, 1),
-                    elevation=t['elevation'] + random.gauss(0, 0.5),
-                    snr=t['snr'] + random.gauss(0, 2)
-                ))
-        return detected
+        return [
+            RadarTarget(
+                id=t['id'],
+                range=t['range'] + random.gauss(0, 10),
+                velocity=t['velocity'] + random.gauss(0, 2),
+                azimuth=t['azimuth'] + random.gauss(0, 1),
+                elevation=t['elevation'] + random.gauss(0, 0.5),
+                snr=t['snr'] + random.gauss(0, 2)
+            )
+            for t in self.targets
+            if random.random() < (t['snr'] / 35)
+        ]
 
 # ============================================================================
 # MAIN GUI APPLICATION
@@ -566,7 +562,7 @@ class RadarDemoGUI:
         
         scrollable_frame.bind(
             "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            lambda _e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
         
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
@@ -586,7 +582,7 @@ class RadarDemoGUI:
             ('CFAR Threshold (dB):', 'cfar', 13.0, 5.0, 30.0)
         ]
         
-        for i, (label, key, default, minv, maxv) in enumerate(settings):
+        for _i, (label, key, default, minv, maxv) in enumerate(settings):
             frame = ttk.Frame(scrollable_frame)
             frame.pack(fill='x', padx=10, pady=5)
             
@@ -745,7 +741,7 @@ class RadarDemoGUI:
             # Update time
             self.time_label.config(text=time.strftime("%H:%M:%S"))
             
-        except Exception as e:
+        except (ValueError, IndexError) as e:
             logger.error(f"Animation error: {e}")
         
         # Schedule next update
@@ -940,7 +936,7 @@ class RadarDemoGUI:
             messagebox.showinfo("Success", "Settings applied")
             logger.info("Settings updated")
             
-        except Exception as e:
+        except (ValueError, tk.TclError) as e:
             messagebox.showerror("Error", f"Invalid settings: {e}")
     
     def apply_display_settings(self):
@@ -981,7 +977,7 @@ class RadarDemoGUI:
         )
         if filename:
             try:
-                with open(filename, 'r') as f:
+                with open(filename) as f:
                     config = json.load(f)
                 
                 # Apply settings
@@ -1004,7 +1000,7 @@ class RadarDemoGUI:
                 messagebox.showinfo("Success", f"Loaded configuration from {filename}")
                 logger.info(f"Configuration loaded from {filename}")
                 
-            except Exception as e:
+            except (OSError, json.JSONDecodeError, ValueError, tk.TclError) as e:
                 messagebox.showerror("Error", f"Failed to load: {e}")
     
     def save_config(self):
@@ -1031,7 +1027,7 @@ class RadarDemoGUI:
                 messagebox.showinfo("Success", f"Saved configuration to {filename}")
                 logger.info(f"Configuration saved to {filename}")
                 
-            except Exception as e:
+            except (OSError, TypeError, ValueError) as e:
                 messagebox.showerror("Error", f"Failed to save: {e}")
     
     def export_data(self):
@@ -1061,7 +1057,7 @@ class RadarDemoGUI:
                 messagebox.showinfo("Success", f"Exported {len(frames)} frames to {filename}")
                 logger.info(f"Data exported to {filename}")
                 
-            except Exception as e:
+            except (OSError, ValueError) as e:
                 messagebox.showerror("Error", f"Failed to export: {e}")
     
     def show_calibration(self):
@@ -1205,7 +1201,7 @@ def main():
         root = tk.Tk()
         
         # Create application
-        _app = RadarDemoGUI(root)  # noqa: F841 — keeps reference alive
+        _app = RadarDemoGUI(root)  # keeps reference alive
         
         # Center window
         root.update_idletasks()
@@ -1218,7 +1214,7 @@ def main():
         # Start main loop
         root.mainloop()
         
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Fatal error: {e}")
         messagebox.showerror("Fatal Error", f"Application failed to start:\n{e}")
 

@@ -31,7 +31,6 @@ freq_indices = np.arange(L)
 T = L*Ts
 freq = freq_indices/T
 
-print("The Array is: ", x) #printing the array
 
 plt.figure(figsize = (12, 6))
 plt.subplot(121)

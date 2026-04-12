@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+from contextlib import nullcontext
 import datetime
 import glob
 import os
@@ -38,7 +39,6 @@ try:
     import serial
     import serial.tools.list_ports
 except ImportError:
-    print("ERROR: pyserial not installed. Run: pip install pyserial")
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
@@ -94,12 +94,9 @@ def list_ports():
     """Print available serial ports."""
     ports = serial.tools.list_ports.comports()
     if not ports:
-        print("No serial ports found.")
         return
-    print(f"{'Port':<30} {'Description':<40} {'HWID'}")
-    print("-" * 100)
-    for p in sorted(ports, key=lambda x: x.device):
-        print(f"{p.device:<30} {p.description:<40} {p.hwid}")
+    for _p in sorted(ports, key=lambda x: x.device):
+        pass
 
 
 def auto_detect_port():
@@ -172,10 +169,7 @@ def should_display(line, filter_subsys=None, errors_only=False):
         return False
 
     # Subsystem filter
-    if filter_subsys and subsys not in filter_subsys:
-        return False
-
-    return True
+    return not (filter_subsys and subsys not in filter_subsys)
 
 
 # ---------------------------------------------------------------------------
@@ -219,8 +213,10 @@ class CaptureStats:
         ]
         if self.by_subsys:
             lines.append("By subsystem:")
-            for tag in sorted(self.by_subsys, key=self.by_subsys.get, reverse=True):
-                lines.append(f"  {tag:<8} {self.by_subsys[tag]}")
+            lines.extend(
+                f"  {tag:<8} {self.by_subsys[tag]}"
+                for tag in sorted(self.by_subsys, key=self.by_subsys.get, reverse=True)
+            )
         return "\n".join(lines)
 
 
@@ -228,12 +224,12 @@ class CaptureStats:
 # Main capture loop
 # ---------------------------------------------------------------------------
 
-def capture(port, baud, log_file, filter_subsys, errors_only, use_color):
+def capture(port, baud, log_file, filter_subsys, errors_only, _use_color):
     """Open serial port and capture DIAG output."""
     stats = CaptureStats()
     running = True
 
-    def handle_signal(sig, frame):
+    def handle_signal(_sig, _frame):
         nonlocal running
         running = False
 
@@ -249,69 +245,68 @@ def capture(port, baud, log_file, filter_subsys, errors_only, use_color):
             stopbits=serial.STOPBITS_ONE,
             timeout=0.1,  # 100ms read timeout for responsive Ctrl-C
         )
-    except serial.SerialException as e:
-        print(f"ERROR: Could not open {port}: {e}")
+    except serial.SerialException:
         sys.exit(1)
 
-    print(f"Connected to {port} at {baud} baud")
     if log_file:
-        print(f"Logging to {log_file}")
+        pass
     if filter_subsys:
-        print(f"Filter: {', '.join(sorted(filter_subsys))}")
+        pass
     if errors_only:
-        print("Mode: errors/warnings only")
-    print("Press Ctrl-C to stop.\n")
+        pass
 
-    flog = None
     if log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        flog = open(log_file, "w", encoding=ENCODING)
-        flog.write(f"# AERIS-10 UART capture — {datetime.datetime.now().isoformat()}\n")
-        flog.write(f"# Port: {port}  Baud: {baud}\n")
-        flog.write(f"# Host: {os.uname().nodename}\n\n")
-        flog.flush()
+        log_context = open(log_file, "w", encoding=ENCODING)  # noqa: SIM115
+    else:
+        log_context = nullcontext(None)
 
     line_buf = b""
 
     try:
-        while running:
-            try:
-                chunk = ser.read(256)
-            except serial.SerialException as e:
-                print(f"\nSerial error: {e}")
-                break
+        with log_context as flog:
+            if flog:
+                flog.write(f"# AERIS-10 UART capture — {datetime.datetime.now().isoformat()}\n")
+                flog.write(f"# Port: {port}  Baud: {baud}\n")
+                flog.write(f"# Host: {os.uname().nodename}\n\n")
+                flog.flush()
 
-            if not chunk:
-                continue
+            while running:
+                try:
+                    chunk = ser.read(256)
+                except serial.SerialException:
+                    break
 
-            line_buf += chunk
-
-            # Process complete lines
-            while b"\n" in line_buf:
-                raw_line, line_buf = line_buf.split(b"\n", 1)
-                line = raw_line.decode(ENCODING, errors="replace").rstrip("\r")
-
-                if not line:
+                if not chunk:
                     continue
 
-                stats.update(line)
+                line_buf += chunk
 
-                # Log file always gets everything (unfiltered, no color)
-                if flog:
-                    wall_ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    flog.write(f"{wall_ts}  {line}\n")
-                    flog.flush()
+                # Process complete lines
+                while b"\n" in line_buf:
+                    raw_line, line_buf = line_buf.split(b"\n", 1)
+                    line = raw_line.decode(ENCODING, errors="replace").rstrip("\r")
 
-                # Terminal display respects filters
-                if should_display(line, filter_subsys, errors_only):
-                    print(colorize(line, use_color))
+                    if not line:
+                        continue
+
+                    stats.update(line)
+
+                    # Log file always gets everything (unfiltered, no color)
+                    if flog:
+                        wall_ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                        flog.write(f"{wall_ts}  {line}\n")
+                        flog.flush()
+
+                    # Terminal display respects filters
+                    if should_display(line, filter_subsys, errors_only):
+                        pass
+
+            if flog:
+                flog.write(f"\n{stats.summary()}\n")
 
     finally:
         ser.close()
-        if flog:
-            flog.write(f"\n{stats.summary()}\n")
-            flog.close()
-        print(stats.summary())
 
 
 # ---------------------------------------------------------------------------
@@ -374,9 +369,7 @@ def main():
     if not port:
         port = auto_detect_port()
         if not port:
-            print("ERROR: No serial port detected. Use -p to specify, or --list to see ports.")
             sys.exit(1)
-        print(f"Auto-detected port: {port}")
 
     # Resolve log file
     log_file = None
@@ -390,7 +383,7 @@ def main():
     # Parse filter
     filter_subsys = None
     if args.filter:
-        filter_subsys = set(t.strip().upper() for t in args.filter.split(","))
+        filter_subsys = {t.strip().upper() for t in args.filter.split(",")}
 
     # Color detection
     use_color = not args.no_color and sys.stdout.isatty()

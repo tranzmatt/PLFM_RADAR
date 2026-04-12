@@ -91,9 +91,9 @@ z_edges = np.concatenate([z_centers - slot_L/2.0, z_centers + slot_L/2.0])
 # -------------------------
 # Mesh lines — EXPLICIT (no GetLine calls)
 # -------------------------
-x_lines = sorted(set([x_min, -t_metal, 0.0, a, a+t_metal, x_max] + list(x_edges)))
+x_lines = sorted({x_min, -t_metal, 0.0, a, a + t_metal, x_max, *list(x_edges)})
 y_lines = [y_min, 0.0, b, b+t_metal, y_max]
-z_lines = sorted(set([z_min, 0.0, L, z_max] + list(z_edges)))
+z_lines = sorted({z_min, 0.0, L, z_max, *list(z_edges)})
 
 mesh.AddLine('x', x_lines)
 mesh.AddLine('y', y_lines)
@@ -123,7 +123,7 @@ pec.AddBox([-t_metal,-t_metal,0],[a+t_metal,0,       L])          # bottom
 pec.AddBox([-t_metal, b, 0],     [a+t_metal,b+t_metal,L])         # top
 
 # Slots = AIR boxes overriding the top metal
-for zc, xc in zip(z_centers, x_centers):
+for zc, xc in zip(z_centers, x_centers, strict=False):
     x1, x2 = xc - slot_w/2.0, xc + slot_w/2.0
     z1, z2 = zc - slot_L/2.0, zc + slot_L/2.0
     prim = air.AddBox([x1, b, z1], [x2, b+t_metal, z2])
@@ -181,7 +181,7 @@ if simulate:
 # Post-processing: S-params & impedance
 # -------------------------
 freq = np.linspace(f_start, f_stop, 401)
-ports = [p for p in FDTD.ports]   # Port 1 & Port 2 in creation order
+ports = list(FDTD.ports)   # Port 1 & Port 2 in creation order
 for p in ports:
     p.CalcPort(Sim_Path, freq)
 
@@ -226,9 +226,6 @@ mismatch = 1.0 - np.abs(S11[idx_f0])**2   # (1 - |S11|^2)
 Gmax_lin = Dmax_lin * float(mismatch)
 Gmax_dBi = 10*np.log10(Gmax_lin)
 
-print(f"Max directivity @ {f0/1e9:.3f} GHz: {10*np.log10(Dmax_lin):.2f} dBi")
-print(f"Mismatch term  (1-|S11|^2)        : {float(mismatch):.3f}")
-print(f"Estimated max realized gain       : {Gmax_dBi:.2f} dBi")
 
 # 3D normalized pattern
 E = np.squeeze(res.E_norm)     # shape [f, th, ph] -> [th, ph]
@@ -254,7 +251,7 @@ plt.figure(figsize=(8.4,2.8))
 plt.fill_between(
     [0, a], [0, 0], [L, L], color='#dddddd', alpha=0.5, step='pre', label='WG aperture (top)'
 )
-for zc, xc in zip(z_centers, x_centers):
+for zc, xc in zip(z_centers, x_centers, strict=False):
     plt.gca().add_patch(plt.Rectangle((xc - slot_w/2.0, zc - slot_L/2.0),
                                       slot_w, slot_L, fc='#3355ff', ec='k'))
 plt.xlim(-2, a + 2)

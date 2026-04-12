@@ -368,7 +368,7 @@ class TestRadarAcquisition(unittest.TestCase):
         # Wait for at least one frame (mock produces ~32 samples per read,
         # need 2048 for a full frame, so may take a few seconds)
         frame = None
-        try:
+        try:  # noqa: SIM105
             frame = fq.get(timeout=10)
         except queue.Empty:
             pass
@@ -421,8 +421,8 @@ class TestEndToEnd(unittest.TestCase):
 
     def test_command_roundtrip_all_opcodes(self):
         """Verify all opcodes produce valid 4-byte commands."""
-        opcodes = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x10, 0x11, 0x12,
-                   0x13, 0x14, 0x15, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+        opcodes = [0x01, 0x02, 0x03, 0x04, 0x10, 0x11, 0x12,
+                   0x13, 0x14, 0x15, 0x16, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
                    0x26, 0x27, 0x30, 0x31, 0xFF]
         for op in opcodes:
             cmd = RadarProtocol.build_command(op, 42)
@@ -630,8 +630,8 @@ class TestReplayConnection(unittest.TestCase):
         cmd = RadarProtocol.build_command(0x01, 1)
         conn.write(cmd)
         self.assertFalse(conn._needs_rebuild)
-        # Send STREAM_ENABLE (hardware-only)
-        cmd = RadarProtocol.build_command(0x05, 7)
+        # Send STREAM_CONTROL (hardware-only, opcode 0x04)
+        cmd = RadarProtocol.build_command(0x04, 7)
         conn.write(cmd)
         self.assertFalse(conn._needs_rebuild)
         conn.close()
@@ -668,14 +668,14 @@ class TestReplayConnection(unittest.TestCase):
 
 
 class TestOpcodeEnum(unittest.TestCase):
-    """Verify Opcode enum matches RTL host register map."""
+    """Verify Opcode enum matches RTL host register map (radar_system_top.v)."""
 
-    def test_gain_shift_is_0x06(self):
-        """GAIN_SHIFT opcode must be 0x06 (not 0x16)."""
-        self.assertEqual(Opcode.GAIN_SHIFT, 0x06)
+    def test_gain_shift_is_0x16(self):
+        """GAIN_SHIFT opcode must be 0x16 (matches radar_system_top.v:928)."""
+        self.assertEqual(Opcode.GAIN_SHIFT, 0x16)
 
     def test_no_digital_gain_alias(self):
-        """DIGITAL_GAIN should NOT exist (was bogus 0x16 alias)."""
+        """DIGITAL_GAIN should NOT exist (use GAIN_SHIFT)."""
         self.assertFalse(hasattr(Opcode, 'DIGITAL_GAIN'))
 
     def test_self_test_trigger(self):
@@ -691,21 +691,40 @@ class TestOpcodeEnum(unittest.TestCase):
         self.assertIn(0x30, _HARDWARE_ONLY_OPCODES)
         self.assertIn(0x31, _HARDWARE_ONLY_OPCODES)
 
-    def test_0x16_not_in_hardware_only(self):
-        """Bogus 0x16 must not be in _HARDWARE_ONLY_OPCODES."""
-        self.assertNotIn(0x16, _HARDWARE_ONLY_OPCODES)
+    def test_0x16_in_hardware_only(self):
+        """GAIN_SHIFT 0x16 must be in _HARDWARE_ONLY_OPCODES."""
+        self.assertIn(0x16, _HARDWARE_ONLY_OPCODES)
 
-    def test_stream_enable_is_0x05(self):
-        """STREAM_ENABLE must be 0x05 (not 0x04)."""
-        self.assertEqual(Opcode.STREAM_ENABLE, 0x05)
+    def test_stream_control_is_0x04(self):
+        """STREAM_CONTROL must be 0x04 (matches radar_system_top.v:906)."""
+        self.assertEqual(Opcode.STREAM_CONTROL, 0x04)
+
+    def test_legacy_aliases_removed(self):
+        """Legacy aliases must NOT exist in production Opcode enum."""
+        for name in ("TRIGGER", "PRF_DIV", "NUM_CHIRPS", "CHIRP_TIMER",
+                      "STREAM_ENABLE", "THRESHOLD"):
+            self.assertFalse(hasattr(Opcode, name),
+                             f"Legacy alias Opcode.{name} should not exist")
+
+    def test_radar_mode_names(self):
+        """New canonical names must exist and match FPGA opcodes."""
+        self.assertEqual(Opcode.RADAR_MODE, 0x01)
+        self.assertEqual(Opcode.TRIGGER_PULSE, 0x02)
+        self.assertEqual(Opcode.DETECT_THRESHOLD, 0x03)
+        self.assertEqual(Opcode.STREAM_CONTROL, 0x04)
+
+    def test_stale_opcodes_not_in_hardware_only(self):
+        """Old wrong opcode values must not be in _HARDWARE_ONLY_OPCODES."""
+        self.assertNotIn(0x05, _HARDWARE_ONLY_OPCODES)  # was wrong STREAM_ENABLE
+        self.assertNotIn(0x06, _HARDWARE_ONLY_OPCODES)  # was wrong GAIN_SHIFT
 
     def test_all_rtl_opcodes_present(self):
-        """Every RTL opcode has a matching Opcode enum member."""
-        expected = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-                    0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+        """Every RTL opcode (from radar_system_top.v) has a matching Opcode enum member."""
+        expected = {0x01, 0x02, 0x03, 0x04,
+                    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
                     0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
                     0x30, 0x31, 0xFF}
-        enum_values = set(int(m) for m in Opcode)
+        enum_values = {int(m) for m in Opcode}
         for op in expected:
             self.assertIn(op, enum_values, f"0x{op:02X} missing from Opcode enum")
 

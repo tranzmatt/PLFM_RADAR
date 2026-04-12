@@ -5,7 +5,7 @@ gen_multiseg_golden.py
 Generate golden reference data for matched_filter_multi_segment co-simulation.
 
 Tests the overlap-save segmented convolution wrapper:
-  - Long chirp: 3072 samples (4 segments × 1024, with 128-sample overlap)
+  - Long chirp: 3072 samples (4 segments x 1024, with 128-sample overlap)
   - Short chirp: 50 samples zero-padded to 1024 (1 segment)
 
 The matched_filter_processing_chain is already verified bit-perfect.
@@ -234,7 +234,6 @@ def generate_long_chirp_test():
                 # In radar_receiver_final.v, the DDC output is sign-extended:
                 #   .ddc_i({{2{adc_i_scaled[15]}}, adc_i_scaled})
                 # So 16-bit -> 18-bit sign-extend -> then multi_segment does:
-                #   ddc_i[17:2] + ddc_i[1]
                 # For sign-extended 18-bit from 16-bit:
                 #   ddc_i[17:2] = original 16-bit value (since bits [17:16] = sign extension)
                 #   ddc_i[1] = bit 1 of original value
@@ -277,9 +276,6 @@ def generate_long_chirp_test():
         out_re, out_im = mf_chain.process(seg_data_i, seg_data_q, ref_i, ref_q)
         segment_results.append((out_re, out_im))
 
-        print(f"  Segment {seg}: collected {buffer_write_ptr} buffer samples, "
-              f"total chirp samples = {chirp_samples_collected}, "
-              f"input_idx = {input_idx}")
 
     # Write hex files for the testbench
     out_dir = os.path.dirname(os.path.abspath(__file__))
@@ -317,7 +313,6 @@ def generate_long_chirp_test():
             for b in range(1024):
                 f.write(f'{seg},{b},{out_re[b]},{out_im[b]}\n')
 
-    print(f"\n  Written {LONG_SEGMENTS * 1024} golden samples to {csv_path}")
 
     return TOTAL_SAMPLES, LONG_SEGMENTS, segment_results
 
@@ -343,8 +338,8 @@ def generate_short_chirp_test():
 
     # Zero-pad to 1024 (as RTL does in ST_ZERO_PAD)
     # Note: padding computed here for documentation; actual buffer uses buf_i/buf_q below
-    _padded_i = list(input_i) + [0] * (BUFFER_SIZE - SHORT_SAMPLES)  # noqa: F841
-    _padded_q = list(input_q) + [0] * (BUFFER_SIZE - SHORT_SAMPLES)  # noqa: F841
+    _padded_i = list(input_i) + [0] * (BUFFER_SIZE - SHORT_SAMPLES)
+    _padded_q = list(input_q) + [0] * (BUFFER_SIZE - SHORT_SAMPLES)
 
     # The buffer truncation: ddc_i[17:2] + ddc_i[1]
     # For data already 16-bit sign-extended to 18: result is (val >> 2) + bit1
@@ -381,7 +376,6 @@ def generate_short_chirp_test():
     # Write hex files
     out_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Input (18-bit)
     all_input_i_18 = []
     all_input_q_18 = []
     for n in range(SHORT_SAMPLES):
@@ -403,19 +397,12 @@ def generate_short_chirp_test():
         for b in range(1024):
             f.write(f'{b},{out_re[b]},{out_im[b]}\n')
 
-    print(f"  Written 1024 short chirp golden samples to {csv_path}")
     return out_re, out_im
 
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("Multi-Segment Matched Filter Golden Reference Generator")
-    print("=" * 60)
 
-    print("\n--- Long Chirp (4 segments, overlap-save) ---")
     total_samples, num_segs, seg_results = generate_long_chirp_test()
-    print(f"  Total input samples: {total_samples}")
-    print(f"  Segments: {num_segs}")
 
     for seg in range(num_segs):
         out_re, out_im = seg_results[seg]
@@ -427,9 +414,7 @@ if __name__ == '__main__':
             if mag > max_mag:
                 max_mag = mag
                 peak_bin = b
-        print(f"  Seg {seg}: peak at bin {peak_bin}, magnitude {max_mag}")
 
-    print("\n--- Short Chirp (1 segment, zero-padded) ---")
     short_re, short_im = generate_short_chirp_test()
     max_mag = 0
     peak_bin = 0
@@ -438,8 +423,3 @@ if __name__ == '__main__':
         if mag > max_mag:
             max_mag = mag
             peak_bin = b
-    print(f"  Short chirp: peak at bin {peak_bin}, magnitude {max_mag}")
-
-    print("\n" + "=" * 60)
-    print("ALL GOLDEN FILES GENERATED")
-    print("=" * 60)

@@ -26,7 +26,6 @@ import time
 import random
 import logging
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional, Tuple
 from enum import Enum
 
 # PyQt6 imports
@@ -198,12 +197,12 @@ class RadarMapWidget(QWidget):
             altitude=100.0,
             pitch=0.0
         )
-        self._targets: List[RadarTarget] = []
+        self._targets: list[RadarTarget] = []
         self._coverage_radius = 50000  # meters
         self._tile_server = TileServer.OPENSTREETMAP
         self._show_coverage = True
         self._show_trails = False
-        self._target_history: Dict[int, List[Tuple[float, float]]] = {}
+        self._target_history: dict[int, list[tuple[float, float]]] = {}
         
         # Setup UI
         self._setup_ui()
@@ -908,7 +907,7 @@ class RadarMapWidget(QWidget):
         """Handle marker click events"""
         self.targetSelected.emit(target_id)
     
-    def _on_tile_server_changed(self, index: int):
+    def _on_tile_server_changed(self, _index: int):
         """Handle tile server change"""
         server = self._tile_combo.currentData()
         self._tile_server = server
@@ -947,7 +946,7 @@ class RadarMapWidget(QWidget):
             f"{gps_data.altitude}, {gps_data.pitch}, {gps_data.heading})"
         )
     
-    def set_targets(self, targets: List[RadarTarget]):
+    def set_targets(self, targets: list[RadarTarget]):
         """Update all targets on the map"""
         self._targets = targets
         
@@ -980,7 +979,7 @@ def polar_to_geographic(
     radar_lon: float, 
     range_m: float, 
     azimuth_deg: float
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """
     Convert polar coordinates (range, azimuth) relative to radar
     to geographic coordinates (latitude, longitude).
@@ -1028,7 +1027,7 @@ class TargetSimulator(QObject):
         super().__init__(parent)
         
         self._radar_position = radar_position
-        self._targets: List[RadarTarget] = []
+        self._targets: list[RadarTarget] = []
         self._next_id = 1
         self._timer = QTimer()
         self._timer.timeout.connect(self._update_targets)
@@ -1164,7 +1163,7 @@ class RadarDashboard(QMainWindow):
             timestamp=time.time()
         )
         self._settings = RadarSettings()
-        self._simulator: Optional[TargetSimulator] = None
+        self._simulator: TargetSimulator | None = None
         self._demo_mode = True
         
         # Setup UI
@@ -1571,7 +1570,7 @@ class RadarDashboard(QMainWindow):
             self._simulator._add_random_target()
             logger.info("Added random target")
     
-    def _on_targets_updated(self, targets: List[RadarTarget]):
+    def _on_targets_updated(self, targets: list[RadarTarget]):
         """Handle updated target list from simulator"""
         # Update map
         self._map_widget.set_targets(targets)
@@ -1582,7 +1581,7 @@ class RadarDashboard(QMainWindow):
         # Update table
         self._update_targets_table(targets)
     
-    def _update_targets_table(self, targets: List[RadarTarget]):
+    def _update_targets_table(self, targets: list[RadarTarget]):
         """Update the targets table"""
         self._targets_table.setRowCount(len(targets))
         

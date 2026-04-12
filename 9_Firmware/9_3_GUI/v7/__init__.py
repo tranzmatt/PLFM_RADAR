@@ -19,19 +19,25 @@ from .models import (
     DARK_TREEVIEW, DARK_TREEVIEW_ALT,
     DARK_SUCCESS, DARK_WARNING, DARK_ERROR, DARK_INFO,
     USB_AVAILABLE, FTDI_AVAILABLE, SCIPY_AVAILABLE,
-    SKLEARN_AVAILABLE, FILTERPY_AVAILABLE, CRCMOD_AVAILABLE,
+    SKLEARN_AVAILABLE, FILTERPY_AVAILABLE,
 )
 
-# Hardware interfaces
+# Hardware interfaces — production protocol via radar_protocol.py
 from .hardware import (
-    FT2232HQInterface,
+    FT2232HConnection,
+    ReplayConnection,
+    RadarProtocol,
+    Opcode,
+    RadarAcquisition,
+    RadarFrame,
+    StatusResponse,
+    DataRecorder,
     STM32USBInterface,
 )
 
 # Processing pipeline
 from .processing import (
     RadarProcessor,
-    RadarPacketParser,
     USBPacketParser,
     apply_pitch_correction,
 )
@@ -56,7 +62,7 @@ from .dashboard import (
     RangeDopplerCanvas,
 )
 
-__all__ = [
+__all__ = [  # noqa: RUF022
     # models
     "RadarTarget", "RadarSettings", "GPSData", "ProcessingConfig", "TileServer",
     "DARK_BG", "DARK_FG", "DARK_ACCENT", "DARK_HIGHLIGHT", "DARK_BORDER",
@@ -64,11 +70,13 @@ __all__ = [
     "DARK_TREEVIEW", "DARK_TREEVIEW_ALT",
     "DARK_SUCCESS", "DARK_WARNING", "DARK_ERROR", "DARK_INFO",
     "USB_AVAILABLE", "FTDI_AVAILABLE", "SCIPY_AVAILABLE",
-    "SKLEARN_AVAILABLE", "FILTERPY_AVAILABLE", "CRCMOD_AVAILABLE",
-    # hardware
-    "FT2232HQInterface", "STM32USBInterface",
+    "SKLEARN_AVAILABLE", "FILTERPY_AVAILABLE",
+    # hardware — production FPGA protocol
+    "FT2232HConnection", "ReplayConnection", "RadarProtocol", "Opcode",
+    "RadarAcquisition", "RadarFrame", "StatusResponse", "DataRecorder",
+    "STM32USBInterface",
     # processing
-    "RadarProcessor", "RadarPacketParser", "USBPacketParser",
+    "RadarProcessor", "USBPacketParser",
     "apply_pitch_correction",
     # workers
     "RadarDataWorker", "GPSDataWorker", "TargetSimulator",

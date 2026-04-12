@@ -12,7 +12,6 @@ coverage circle, target trails, velocity-based color coding, popups, legend.
 
 import json
 import logging
-from typing import List
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame,
@@ -65,7 +64,7 @@ class MapBridge(QObject):
 
     @pyqtSlot(str)
     def logFromJS(self, message: str):
-        logger.debug(f"[JS] {message}")
+        logger.info(f"[JS] {message}")
 
     @property
     def is_ready(self) -> bool:
@@ -96,7 +95,8 @@ class RadarMapWidget(QWidget):
             latitude=radar_lat, longitude=radar_lon,
             altitude=0.0, pitch=0.0, heading=0.0,
         )
-        self._targets: List[RadarTarget] = []
+        self._targets: list[RadarTarget] = []
+        self._pending_targets: list[RadarTarget] | None = None
         self._coverage_radius = 50_000   # metres
         self._tile_server = TileServer.OPENSTREETMAP
         self._show_coverage = True
@@ -282,15 +282,10 @@ function initMap() {{
         .setView([{lat}, {lon}], 10);
     setTileServer('osm');
 
-    var radarIcon = L.divIcon({{
-        className:'radar-icon',
-        html:'<div style="background:radial-gradient(circle,#FF5252 0%,#D32F2F 100%);'+
-             'width:24px;height:24px;border-radius:50%;border:3px solid white;'+
-             'box-shadow:0 2px 8px rgba(0,0,0,0.5);"></div>',
-        iconSize:[24,24], iconAnchor:[12,12]
-    }});
-
-    radarMarker = L.marker([{lat},{lon}], {{ icon:radarIcon, zIndexOffset:1000 }}).addTo(map);
+    radarMarker = L.circleMarker([{lat},{lon}], {{
+        radius:12, fillColor:'#FF5252', color:'white',
+        weight:3, opacity:1, fillOpacity:1
+    }}).addTo(map);
     updateRadarPopup();
 
     coverageCircle = L.circle([{lat},{lon}], {{
@@ -366,64 +361,70 @@ function updateRadarPosition(lat,lon,alt,pitch,heading) {{
 }}
 
 function updateTargets(targetsJson) {{
-    var targets = JSON.parse(targetsJson);
-    var currentIds = {{}};
+    try {{
+        if(!map) {{
+            if(bridge) bridge.logFromJS('updateTargets: map not ready yet');
+            return;
+        }}
+        var targets = JSON.parse(targetsJson);
+        if(bridge) bridge.logFromJS('updateTargets: parsed '+targets.length+' targets');
+        var currentIds = {{}};
 
-    targets.forEach(function(t) {{
-        currentIds[t.id] = true;
-        var lat=t.latitude, lon=t.longitude;
-        var color = getTargetColor(t.velocity);
-        var sz = Math.max(10, Math.min(20, 10+t.snr/3));
+        targets.forEach(function(t) {{
+            currentIds[t.id] = true;
+            var lat=t.latitude, lon=t.longitude;
+            var color = getTargetColor(t.velocity);
+            var radius = Math.max(5, Math.min(12, 5+(t.snr||0)/5));
 
-        if(!targetTrailHistory[t.id]) targetTrailHistory[t.id] = [];
-        targetTrailHistory[t.id].push([lat,lon]);
-        if(targetTrailHistory[t.id].length > maxTrailLength)
-            targetTrailHistory[t.id].shift();
+            if(!targetTrailHistory[t.id]) targetTrailHistory[t.id] = [];
+            targetTrailHistory[t.id].push([lat,lon]);
+            if(targetTrailHistory[t.id].length > maxTrailLength)
+                targetTrailHistory[t.id].shift();
 
-        if(targetMarkers[t.id]) {{
-            targetMarkers[t.id].setLatLng([lat,lon]);
-            targetMarkers[t.id].setIcon(makeIcon(color,sz));
-            if(targetTrails[t.id]) {{
-                targetTrails[t.id].setLatLngs(targetTrailHistory[t.id]);
-                targetTrails[t.id].setStyle({{ color:color }});
-            }}
-        }} else {{
-            var marker = L.marker([lat,lon], {{ icon:makeIcon(color,sz) }}).addTo(map);
-            marker.on(
-                'click',
-                (function(id){{
-                    return function(){{ if(bridge) bridge.onMarkerClick(id); }};
-                }})(t.id)
-            );
-            targetMarkers[t.id] = marker;
-            if(showTrails) {{
-                targetTrails[t.id] = L.polyline(targetTrailHistory[t.id], {{
-                    color:color, weight:3, opacity:0.7, lineCap:'round', lineJoin:'round'
+            if(targetMarkers[t.id]) {{
+                targetMarkers[t.id].setLatLng([lat,lon]);
+                targetMarkers[t.id].setStyle({{
+                    fillColor:color, color:'white', radius:radius
+                }});
+                if(targetTrails[t.id]) {{
+                    targetTrails[t.id].setLatLngs(targetTrailHistory[t.id]);
+                    targetTrails[t.id].setStyle({{ color:color }});
+                }}
+            }} else {{
+                var marker = L.circleMarker([lat,lon], {{
+                    radius:radius, fillColor:color, color:'white',
+                    weight:2, opacity:1, fillOpacity:0.9
                 }}).addTo(map);
+                marker.on(
+                    'click',
+                    (function(id){{
+                        return function(){{ if(bridge) bridge.onMarkerClick(id); }};
+                    }})(t.id)
+                );
+                targetMarkers[t.id] = marker;
+                if(showTrails) {{
+                    targetTrails[t.id] = L.polyline(targetTrailHistory[t.id], {{
+                        color:color, weight:3, opacity:0.7,
+                        lineCap:'round', lineJoin:'round'
+                    }}).addTo(map);
+                }}
+            }}
+            updateTargetPopup(t);
+        }});
+
+        for(var id in targetMarkers) {{
+            if(!currentIds[id]) {{
+                map.removeLayer(targetMarkers[id]); delete targetMarkers[id];
+                if(targetTrails[id]) {{
+                    map.removeLayer(targetTrails[id]);
+                    delete targetTrails[id];
+                }}
+                delete targetTrailHistory[id];
             }}
         }}
-        updateTargetPopup(t);
-    }});
-
-    for(var id in targetMarkers) {{
-        if(!currentIds[id]) {{
-            map.removeLayer(targetMarkers[id]); delete targetMarkers[id];
-            if(targetTrails[id]) {{ map.removeLayer(targetTrails[id]); delete targetTrails[id]; }}
-            delete targetTrailHistory[id];
-        }}
+    }} catch(e) {{
+        if(bridge) bridge.logFromJS('updateTargets ERROR: '+e.message);
     }}
-}}
-
-function makeIcon(color,sz) {{
-    return L.divIcon({{
-        className:'target-icon',
-        html:'<div style="background-color:'+color+';width:'+sz+'px;height:'+sz+'px;'+
-             (
-                 'border-radius:50%;border:2px solid white;'+
-                 'box-shadow:0 2px 6px rgba(0,0,0,0.4);'
-             )+'</div>',
-        iconSize:[sz,sz], iconAnchor:[sz/2,sz/2]
-    }});
 }}
 
 function updateTargetPopup(t) {{
@@ -432,36 +433,27 @@ function updateTargetPopup(t) {{
         ? 'status-approaching'
         : (t.velocity<-1 ? 'status-receding' : 'status-stationary');
     var st = t.velocity>1?'Approaching':(t.velocity<-1?'Receding':'Stationary');
+    var rng = (typeof t.range === 'number') ? t.range.toFixed(1) : '?';
+    var vel = (typeof t.velocity === 'number') ? t.velocity.toFixed(1) : '?';
+    var az  = (typeof t.azimuth === 'number') ? t.azimuth.toFixed(1) : '?';
+    var el  = (typeof t.elevation === 'number') ? t.elevation.toFixed(1) : '?';
+    var snr = (typeof t.snr === 'number') ? t.snr.toFixed(1) : '?';
     targetMarkers[t.id].bindPopup(
         '<div class="popup-title">Target #'+t.id+'</div>'+
-        (
-            '<div class="popup-row"><span class="popup-label">Range:</span>'+
-            '<span class="popup-value">'+t.range.toFixed(1)+' m</span></div>'
-        )+
-        (
-            '<div class="popup-row"><span class="popup-label">Velocity:</span>'+
-            '<span class="popup-value">'+t.velocity.toFixed(1)+' m/s</span></div>'
-        )+
-        (
-            '<div class="popup-row"><span class="popup-label">Azimuth:</span>'+
-            '<span class="popup-value">'+t.azimuth.toFixed(1)+'&deg;</span></div>'
-        )+
-        (
-            '<div class="popup-row"><span class="popup-label">Elevation:</span>'+
-            '<span class="popup-value">'+t.elevation.toFixed(1)+'&deg;</span></div>'
-        )+
-        (
-            '<div class="popup-row"><span class="popup-label">SNR:</span>'+
-            '<span class="popup-value">'+t.snr.toFixed(1)+' dB</span></div>'
-        )+
-        (
-            '<div class="popup-row"><span class="popup-label">Track:</span>'+
-            '<span class="popup-value">'+t.track_id+'</span></div>'
-        )+
-        (
-            '<div class="popup-row"><span class="popup-label">Status:</span>'+
-            '<span class="popup-value '+sc+'">'+st+'</span></div>'
-        )
+        '<div class="popup-row"><span class="popup-label">Range:</span>'+
+        '<span class="popup-value">'+rng+' m</span></div>'+
+        '<div class="popup-row"><span class="popup-label">Velocity:</span>'+
+        '<span class="popup-value">'+vel+' m/s</span></div>'+
+        '<div class="popup-row"><span class="popup-label">Azimuth:</span>'+
+        '<span class="popup-value">'+az+'&deg;</span></div>'+
+        '<div class="popup-row"><span class="popup-label">Elevation:</span>'+
+        '<span class="popup-value">'+el+'&deg;</span></div>'+
+        '<div class="popup-row"><span class="popup-label">SNR:</span>'+
+        '<span class="popup-value">'+snr+' dB</span></div>'+
+        '<div class="popup-row"><span class="popup-label">Track:</span>'+
+        '<span class="popup-value">'+t.track_id+'</span></div>'+
+        '<div class="popup-row"><span class="popup-label">Status:</span>'+
+        '<span class="popup-value '+sc+'">'+st+'</span></div>'
     );
 }}
 
@@ -531,12 +523,19 @@ document.addEventListener('DOMContentLoaded', function() {{
     def _on_map_ready(self):
         self._status_label.setText(f"Map ready - {len(self._targets)} targets")
         self._status_label.setStyleSheet(f"color: {DARK_SUCCESS};")
+        # Flush any targets that arrived before the map was ready
+        if self._pending_targets is not None:
+            self.set_targets(self._pending_targets)
+            self._pending_targets = None
 
     def _on_marker_clicked(self, tid: int):
         self.targetSelected.emit(tid)
 
     def _run_js(self, script: str):
-        self._web_view.page().runJavaScript(script)
+        def _js_callback(result):
+            if result is not None:
+                logger.info("JS result: %s", result)
+        self._web_view.page().runJavaScript(script, 0, _js_callback)
 
     # ---- control bar callbacks ---------------------------------------------
 
@@ -571,12 +570,20 @@ document.addEventListener('DOMContentLoaded', function() {{
             f"{gps.altitude},{gps.pitch},{gps.heading})"
         )
 
-    def set_targets(self, targets: List[RadarTarget]):
+    def set_targets(self, targets: list[RadarTarget]):
         self._targets = targets
+        if not self._bridge.is_ready:
+            logger.info("Map not ready yet — queuing %d targets", len(targets))
+            self._pending_targets = targets
+            return
         data = [t.to_dict() for t in targets]
-        js = json.dumps(data).replace("'", "\\'")
+        js_payload = json.dumps(data).replace("\\", "\\\\").replace("'", "\\'")
+        logger.info(
+            "set_targets: %d targets, JSON len=%d, first 200 chars: %s",
+            len(targets), len(js_payload), js_payload[:200],
+        )
         self._status_label.setText(f"{len(targets)} targets tracked")
-        self._run_js(f"updateTargets('{js}')")
+        self._run_js(f"updateTargets('{js_payload}')")
 
     def set_coverage_radius(self, radius_m: float):
         self._coverage_radius = radius_m

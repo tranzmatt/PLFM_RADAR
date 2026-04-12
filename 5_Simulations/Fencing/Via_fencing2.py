@@ -1,6 +1,5 @@
 import matplotlib.pyplot as plt
 
-# Dimensions (all in mm)
 line_width = 0.204
 via_pad_A = 0.20
 via_pad_B = 0.45
@@ -50,14 +49,14 @@ ax.text(-2, polygon_y1 + 0.5, "Via B Ø0.45 mm pad", color="red")
 
 # Add pitch dimension (horizontal between vias)
 ax.annotate("", xy=(2, polygon_y1 + 0.2), xytext=(2 + via_pitch, polygon_y1 + 0.2),
-            arrowprops=dict(arrowstyle="<->", color="purple"))
+            arrowprops={"arrowstyle": "<->", "color": "purple"})
 ax.text(2 + via_pitch/2, polygon_y1 + 0.3, f"{via_pitch:.2f} mm pitch", color="purple", ha="center")
 
 # Add distance from RF line edge to via center
 line_edge_y = rf_line_y + line_width/2
 via_center_y = polygon_y1
 ax.annotate("", xy=(2.4, line_edge_y), xytext=(2.4, via_center_y),
-            arrowprops=dict(arrowstyle="<->", color="brown"))
+            arrowprops={"arrowstyle": "<->", "color": "brown"})
 ax.text(
     2.5, (line_edge_y + via_center_y) / 2, f"{via_center_offset:.2f} mm", color="brown", va="center"
 )

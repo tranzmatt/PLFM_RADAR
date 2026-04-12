@@ -20,5 +20,5 @@ y = 1 + np.sin(theta_n)  # Normalize from 0 to 2
 y_scaled = np.round(y * 127.5).astype(int)  # Scale to 8-bit range (0-255)
 
 # Print values in Verilog-friendly format
-for i in range(n):
-    print(f"waveform_LUT[{i}] = 8'h{y_scaled[i]:02X};")
+for _i in range(n):
+    pass

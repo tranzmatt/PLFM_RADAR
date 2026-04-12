@@ -1,6 +1,5 @@
 import matplotlib.pyplot as plt
 
-# Dimensions (all in mm)
 line_width = 0.204
 substrate_height = 0.102
 via_drill = 0.20

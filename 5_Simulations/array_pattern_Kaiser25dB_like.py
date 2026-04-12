@@ -27,7 +27,7 @@ n_idx = np.arange(N) - (N-1)/2
 y_positions = m_idx * dy
 z_positions = n_idx * dz
 
-def element_factor(theta_rad, phi_rad):
+def element_factor(theta_rad, _phi_rad):
     return np.abs(np.cos(theta_rad))
 
 def array_factor(theta_rad, phi_rad, y_positions, z_positions, wy, wz, theta0_rad, phi0_rad):
@@ -105,8 +105,3 @@ plt.title('Array Pattern Heatmap (|AF·EF|, dB) — Kaiser ~-25 dB')
 plt.tight_layout()
 plt.savefig('Heatmap_Kaiser25dB_like.png', bbox_inches='tight')
 plt.show()
-
-print(
-    'Saved: E_plane_Kaiser25dB_like.png, H_plane_Kaiser25dB_like.png, '
-    'Heatmap_Kaiser25dB_like.png'
-)

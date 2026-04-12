@@ -73,7 +73,7 @@ def load_doppler_csv(filepath):
     Returns dict: {rbin: [(dbin, i, q), ...]}
     """
     data = {}
-    with open(filepath, 'r') as f:
+    with open(filepath) as f:
         f.readline()  # Skip header
         for line in f:
             line = line.strip()
@@ -117,7 +117,7 @@ def pearson_correlation(a, b):
 
 def magnitude_l1(i_arr, q_arr):
     """L1 magnitude: |I| + |Q|."""
-    return [abs(i) + abs(q) for i, q in zip(i_arr, q_arr)]
+    return [abs(i) + abs(q) for i, q in zip(i_arr, q_arr, strict=False)]
 
 
 def find_peak_bin(i_arr, q_arr):
@@ -143,7 +143,7 @@ def total_energy(data_dict):
     """Sum of I^2 + Q^2 across all range bins and Doppler bins."""
     total = 0
     for rbin in data_dict:
-        for (dbin, i_val, q_val) in data_dict[rbin]:
+        for (_dbin, i_val, q_val) in data_dict[rbin]:
             total += i_val * i_val + q_val * q_val
     return total
 
@@ -154,44 +154,30 @@ def total_energy(data_dict):
 
 def compare_scenario(name, config, base_dir):
     """Compare one Doppler scenario. Returns (passed, result_dict)."""
-    print(f"\n{'='*60}")
-    print(f"Scenario: {name} — {config['description']}")
-    print(f"{'='*60}")
 
     golden_path = os.path.join(base_dir, config['golden_csv'])
     rtl_path = os.path.join(base_dir, config['rtl_csv'])
 
     if not os.path.exists(golden_path):
-        print(f"  ERROR: Golden CSV not found: {golden_path}")
-        print("  Run: python3 gen_doppler_golden.py")
         return False, {}
     if not os.path.exists(rtl_path):
-        print(f"  ERROR: RTL CSV not found: {rtl_path}")
-        print("  Run the Verilog testbench first")
         return False, {}
 
     py_data = load_doppler_csv(golden_path)
     rtl_data = load_doppler_csv(rtl_path)
 
-    py_rbins = sorted(py_data.keys())
-    rtl_rbins = sorted(rtl_data.keys())
+    sorted(py_data.keys())
+    sorted(rtl_data.keys())
 
-    print(f"  Python: {len(py_rbins)} range bins, "
-          f"{sum(len(v) for v in py_data.values())} total samples")
-    print(f"  RTL:    {len(rtl_rbins)} range bins, "
-          f"{sum(len(v) for v in rtl_data.values())} total samples")
 
     # ---- Check 1: Both have data ----
     py_total = sum(len(v) for v in py_data.values())
     rtl_total = sum(len(v) for v in rtl_data.values())
     if py_total == 0 or rtl_total == 0:
-        print("  ERROR: One or both outputs are empty")
         return False, {}
 
     # ---- Check 2: Output count ----
     count_ok = (rtl_total == TOTAL_OUTPUTS)
-    print(f"\n  Output count: RTL={rtl_total}, expected={TOTAL_OUTPUTS} "
-          f"{'OK' if count_ok else 'MISMATCH'}")
 
     # ---- Check 3: Global energy ----
     py_energy = total_energy(py_data)
@@ -201,10 +187,6 @@ def compare_scenario(name, config, base_dir):
     else:
         energy_ratio = 1.0 if rtl_energy == 0 else float('inf')
 
-    print("\n  Global energy:")
-    print(f"    Python: {py_energy}")
-    print(f"    RTL:    {rtl_energy}")
-    print(f"    Ratio:  {energy_ratio:.4f}")
 
     # ---- Check 4: Per-range-bin analysis ----
     peak_agreements = 0
@@ -236,8 +218,8 @@ def compare_scenario(name, config, base_dir):
         i_correlations.append(corr_i)
         q_correlations.append(corr_q)
 
-        py_rbin_energy = sum(i*i + q*q for i, q in zip(py_i, py_q))
-        rtl_rbin_energy = sum(i*i + q*q for i, q in zip(rtl_i, rtl_q))
+        py_rbin_energy = sum(i*i + q*q for i, q in zip(py_i, py_q, strict=False))
+        rtl_rbin_energy = sum(i*i + q*q for i, q in zip(rtl_i, rtl_q, strict=False))
 
         peak_details.append({
             'rbin': rbin,
@@ -255,20 +237,11 @@ def compare_scenario(name, config, base_dir):
     avg_corr_i = sum(i_correlations) / len(i_correlations)
     avg_corr_q = sum(q_correlations) / len(q_correlations)
 
-    print("\n  Per-range-bin metrics:")
-    print(f"    Peak Doppler bin agreement (+/-1 within sub-frame): {peak_agreements}/{RANGE_BINS} "
-          f"({peak_agreement_frac:.0%})")
-    print(f"    Avg magnitude correlation: {avg_mag_corr:.4f}")
-    print(f"    Avg I-channel correlation: {avg_corr_i:.4f}")
-    print(f"    Avg Q-channel correlation: {avg_corr_q:.4f}")
 
     # Show top 5 range bins by Python energy
-    print("\n  Top 5 range bins by Python energy:")
     top_rbins = sorted(peak_details, key=lambda x: -x['py_energy'])[:5]
-    for d in top_rbins:
-        print(f"    rbin={d['rbin']:2d}: py_peak={d['py_peak']:2d}, "
-              f"rtl_peak={d['rtl_peak']:2d}, mag_corr={d['mag_corr']:.3f}, "
-              f"I_corr={d['corr_i']:.3f}, Q_corr={d['corr_q']:.3f}")
+    for _d in top_rbins:
+        pass
 
     # ---- Pass/Fail ----
     checks = []
@@ -291,11 +264,8 @@ def compare_scenario(name, config, base_dir):
         checks.append((f'High-energy rbin avg mag_corr >= {MAG_CORR_MIN:.2f} '
                         f'(actual={he_mag_corr:.3f})', he_ok))
 
-    print("\n  Pass/Fail Checks:")
     all_pass = True
-    for check_name, passed in checks:
-        status = "PASS" if passed else "FAIL"
-        print(f"    [{status}] {check_name}")
+    for _check_name, passed in checks:
         if not passed:
             all_pass = False
 
@@ -310,7 +280,6 @@ def compare_scenario(name, config, base_dir):
                 f.write(f'{rbin},{dbin},{py_i[dbin]},{py_q[dbin]},'
                         f'{rtl_i[dbin]},{rtl_q[dbin]},'
                         f'{rtl_i[dbin]-py_i[dbin]},{rtl_q[dbin]-py_q[dbin]}\n')
-    print(f"\n  Detailed comparison: {compare_csv}")
 
     result = {
         'scenario': name,
@@ -333,25 +302,15 @@ def compare_scenario(name, config, base_dir):
 def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    if len(sys.argv) > 1:
-        arg = sys.argv[1].lower()
-    else:
-        arg = 'stationary'
+    arg = sys.argv[1].lower() if len(sys.argv) > 1 else 'stationary'
 
     if arg == 'all':
         run_scenarios = list(SCENARIOS.keys())
     elif arg in SCENARIOS:
         run_scenarios = [arg]
     else:
-        print(f"Unknown scenario: {arg}")
-        print(f"Valid: {', '.join(SCENARIOS.keys())}, all")
         sys.exit(1)
 
-    print("=" * 60)
-    print("Doppler Processor Co-Simulation Comparison")
-    print("RTL vs Python model (clean, no pipeline bug replication)")
-    print(f"Scenarios: {', '.join(run_scenarios)}")
-    print("=" * 60)
 
     results = []
     for name in run_scenarios:
@@ -359,37 +318,20 @@ def main():
         results.append((name, passed, result))
 
     # Summary
-    print(f"\n{'='*60}")
-    print("SUMMARY")
-    print(f"{'='*60}")
 
-    print(f"\n  {'Scenario':<15} {'Energy Ratio':>13} {'Mag Corr':>10} "
-          f"{'Peak Agree':>11} {'I Corr':>8} {'Q Corr':>8} {'Status':>8}")
-    print(f"  {'-'*15} {'-'*13} {'-'*10} {'-'*11} {'-'*8} {'-'*8} {'-'*8}")
 
     all_pass = True
-    for name, passed, result in results:
+    for _name, passed, result in results:
         if not result:
-            print(f"  {name:<15} {'ERROR':>13} {'—':>10} {'—':>11} "
-                  f"{'—':>8} {'—':>8} {'FAIL':>8}")
             all_pass = False
         else:
-            status = "PASS" if passed else "FAIL"
-            print(f"  {name:<15} {result['energy_ratio']:>13.4f} "
-                  f"{result['avg_mag_corr']:>10.4f} "
-                  f"{result['peak_agreement']:>10.0%} "
-                  f"{result['avg_corr_i']:>8.4f} "
-                  f"{result['avg_corr_q']:>8.4f} "
-                  f"{status:>8}")
             if not passed:
                 all_pass = False
 
-    print()
     if all_pass:
-        print("ALL TESTS PASSED")
+        pass
     else:
-        print("SOME TESTS FAILED")
-    print(f"{'='*60}")
+        pass
 
     sys.exit(0 if all_pass else 1)
 

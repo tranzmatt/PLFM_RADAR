@@ -90,8 +90,6 @@ def generate_small_radar_csv(filename="small_test_radar_data.csv"):
     
     df = pd.DataFrame(data)
     df.to_csv(filename, index=False)
-    print(f"Generated small CSV: {filename}")
-    print(f"Total samples: {len(df)}")
     return df
 
 generate_small_radar_csv()

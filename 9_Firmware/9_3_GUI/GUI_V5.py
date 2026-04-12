@@ -28,7 +28,7 @@ except ImportError:
     logging.warning("pyusb not available. USB CDC functionality will be disabled.")
 
 try:
-    from pyftdi.ftdi import Ftdi
+    from pyftdi.ftdi import Ftdi, FtdiError
     from pyftdi.usbtools import UsbTools
 
     FTDI_AVAILABLE = True
@@ -289,7 +289,7 @@ class MapGenerator:
             targets_script = f"updateTargets({targets_json});"
 
         # Fill template
-        map_html = self.map_html_template.format(
+        return self.map_html_template.format(
             lat=gps_data.latitude,
             lon=gps_data.longitude,
             alt=gps_data.altitude,
@@ -298,8 +298,6 @@ class MapGenerator:
             targets_script=targets_script,
             api_key=api_key,
         )
-
-        return map_html
 
     def polar_to_geographic(self, radar_lat, radar_lon, range_m, azimuth_deg):
         """
@@ -369,7 +367,7 @@ class STM32USBInterface:
                                 "device": dev,
                             }
                         )
-                    except Exception:
+                    except (usb.core.USBError, ValueError):
                         devices.append(
                             {
                                 "description": f"STM32 CDC (VID:{vid:04X}, PID:{pid:04X})",
@@ -380,7 +378,7 @@ class STM32USBInterface:
                         )
 
             return devices
-        except Exception as e:
+        except usb.core.USBError as e:
             logging.error(f"Error listing USB devices: {e}")
             # Return mock devices for testing
             return [
@@ -430,7 +428,7 @@ class STM32USBInterface:
             logging.info(f"STM32 USB device opened: {device_info['description']}")
             return True
 
-        except Exception as e:
+        except usb.core.USBError as e:
             logging.error(f"Error opening USB device: {e}")
             return False
 
@@ -446,7 +444,7 @@ class STM32USBInterface:
             packet = self._create_settings_packet(settings)
             logging.info("Sending radar settings to STM32 via USB...")
             return self._send_data(packet)
-        except Exception as e:
+        except (usb.core.USBError, struct.error) as e:
             logging.error(f"Error sending settings via USB: {e}")
             return False
 
@@ -462,9 +460,6 @@ class STM32USBInterface:
             if e.errno == 110:  # Timeout
                 return None
             logging.error(f"USB read error: {e}")
-            return None
-        except Exception as e:
-            logging.error(f"Error reading from USB: {e}")
             return None
 
     def _send_data(self, data):
@@ -483,7 +478,7 @@ class STM32USBInterface:
                 self.ep_out.write(chunk)
 
             return True
-        except Exception as e:
+        except usb.core.USBError as e:
             logging.error(f"Error sending data via USB: {e}")
             return False
 
@@ -509,7 +504,7 @@ class STM32USBInterface:
             try:
                 usb.util.dispose_resources(self.device)
                 self.is_open = False
-            except Exception as e:
+            except usb.core.USBError as e:
                 logging.error(f"Error closing USB device: {e}")
 
 
@@ -525,14 +520,12 @@ class FTDIInterface:
             return []
 
         try:
-            devices = []
             # Get list of all FTDI devices
-            for device in UsbTools.find_all([(0x0403, 0x6010)]):  # FT2232H vendor/product ID
-                devices.append(
-                    {"description": f"FTDI Device {device}", "url": f"ftdi://{device}/1"}
-                )
-            return devices
-        except Exception as e:
+            return [
+                {"description": f"FTDI Device {device}", "url": f"ftdi://{device}/1"}
+                for device in UsbTools.find_all([(0x0403, 0x6010)])
+            ]  # FT2232H vendor/product ID
+        except usb.core.USBError as e:
             logging.error(f"Error listing FTDI devices: {e}")
             # Return mock devices for testing
             return [{"description": "FT2232H Device A", "url": "ftdi://device/1"}]
@@ -560,7 +553,7 @@ class FTDIInterface:
             logging.info(f"FTDI device opened: {device_url}")
             return True
 
-        except Exception as e:
+        except FtdiError as e:
             logging.error(f"Error opening FTDI device: {e}")
             return False
 
@@ -574,7 +567,7 @@ class FTDIInterface:
             if data:
                 return bytes(data)
             return None
-        except Exception as e:
+        except FtdiError as e:
             logging.error(f"Error reading from FTDI: {e}")
             return None
 
@@ -595,8 +588,7 @@ class RadarProcessor:
 
     def dual_cpi_fusion(self, range_profiles_1, range_profiles_2):
         """Dual-CPI fusion for better detection"""
-        fused_profile = np.mean(range_profiles_1, axis=0) + np.mean(range_profiles_2, axis=0)
-        return fused_profile
+        return np.mean(range_profiles_1, axis=0) + np.mean(range_profiles_2, axis=0)
 
     def multi_prf_unwrap(self, doppler_measurements, prf1, prf2):
         """Multi-PRF velocity unwrapping"""
@@ -643,7 +635,7 @@ class RadarProcessor:
 
         return clusters
 
-    def association(self, detections, clusters):
+    def association(self, detections, _clusters):
         """Association of detections to tracks"""
         associated_detections = []
 
@@ -737,7 +729,7 @@ class USBPacketParser:
             if len(data) >= 30 and data[0:4] == b"GPSB":
                 return self._parse_binary_gps_with_pitch(data)
 
-        except Exception as e:
+        except (ValueError, struct.error) as e:
             logging.error(f"Error parsing GPS data: {e}")
 
         return None
@@ -789,7 +781,7 @@ class USBPacketParser:
                 timestamp=time.time(),
             )
 
-        except Exception as e:
+        except (ValueError, struct.error) as e:
             logging.error(f"Error parsing binary GPS with pitch: {e}")
             return None
 
@@ -831,13 +823,12 @@ class RadarPacketParser:
 
         if packet_type == 0x01:
             return self.parse_range_packet(payload)
-        elif packet_type == 0x02:
+        if packet_type == 0x02:
             return self.parse_doppler_packet(payload)
-        elif packet_type == 0x03:
+        if packet_type == 0x03:
             return self.parse_detection_packet(payload)
-        else:
-            logging.warning(f"Unknown packet type: {packet_type:02X}")
-            return None
+        logging.warning(f"Unknown packet type: {packet_type:02X}")
+        return None
 
     def calculate_crc(self, data):
         return self.crc16_func(data)
@@ -860,7 +851,7 @@ class RadarPacketParser:
                 "chirp": chirp_counter,
                 "timestamp": time.time(),
             }
-        except Exception as e:
+        except (ValueError, struct.error) as e:
             logging.error(f"Error parsing range packet: {e}")
             return None
 
@@ -884,7 +875,7 @@ class RadarPacketParser:
                 "chirp": chirp_counter,
                 "timestamp": time.time(),
             }
-        except Exception as e:
+        except (ValueError, struct.error) as e:
             logging.error(f"Error parsing Doppler packet: {e}")
             return None
 
@@ -906,7 +897,7 @@ class RadarPacketParser:
                 "chirp": chirp_counter,
                 "timestamp": time.time(),
             }
-        except Exception as e:
+        except (ValueError, struct.error) as e:
             logging.error(f"Error parsing detection packet: {e}")
             return None
 
@@ -1345,7 +1336,7 @@ class RadarGUI:
 
             logging.info("Radar system started successfully via USB CDC")
 
-        except Exception as e:
+        except (usb.core.USBError, FtdiError, ValueError) as e:
             messagebox.showerror("Error", f"Failed to start radar: {e}")
             logging.error(f"Start radar error: {e}")
 
@@ -1414,7 +1405,7 @@ class RadarGUI:
                             else:
                                 break
 
-                except Exception as e:
+                except FtdiError as e:
                     logging.error(f"Error processing radar data: {e}")
                     time.sleep(0.1)
             else:
@@ -1438,7 +1429,7 @@ class RadarGUI:
                                 f"Alt {gps_data.altitude:.1f}m, "
                                 f"Pitch {gps_data.pitch:.1f}°"
                             )
-                except Exception as e:
+                except (usb.core.USBError, ValueError, struct.error) as e:
                     logging.error(f"Error processing GPS data via USB: {e}")
             time.sleep(0.1)
 
@@ -1501,7 +1492,7 @@ class RadarGUI:
                         f"Pitch {self.current_gps.pitch:.1f}°"
                     )
 
-        except Exception as e:
+        except (ValueError, KeyError) as e:
             logging.error(f"Error processing radar packet: {e}")
 
     def update_range_doppler_map(self, target):
@@ -1568,9 +1559,9 @@ class RadarGUI:
             )
             logging.info(f"Map generated: {self.map_file_path}")
 
-        except Exception as e:
+        except (OSError, ValueError) as e:
             logging.error(f"Error generating map: {e}")
-            self.map_status_label.config(text=f"Map: Error - {str(e)}")
+            self.map_status_label.config(text=f"Map: Error - {e!s}")
 
     def update_gps_display(self):
         """Step 18: Update GPS and pitch display"""
@@ -1657,7 +1648,7 @@ class RadarGUI:
             # Update GPS and pitch display
             self.update_gps_display()
 
-        except Exception as e:
+        except (tk.TclError, RuntimeError) as e:
             logging.error(f"Error updating GUI: {e}")
 
         self.root.after(100, self.update_gui)
@@ -1669,7 +1660,7 @@ def main():
         root = tk.Tk()
         _app = RadarGUI(root)
         root.mainloop()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logging.error(f"Application error: {e}")
         messagebox.showerror("Fatal Error", f"Application failed to start: {e}")
 

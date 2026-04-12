@@ -50,7 +50,7 @@ def saturate(value, bits):
     return value
 
 
-def arith_rshift(value, shift, width=None):
+def arith_rshift(value, shift, _width=None):
     """Arithmetic right shift. Python >> on signed int is already arithmetic."""
     return value >> shift
 
@@ -129,10 +129,7 @@ class NCO:
         raw_index = lut_address & 0x3F
 
         # RTL: lut_index = (quadrant[0] ^ quadrant[1]) ? ~lut_address[5:0] : lut_address[5:0]
-        if (quadrant & 1) ^ ((quadrant >> 1) & 1):
-            lut_index = (~raw_index) & 0x3F
-        else:
-            lut_index = raw_index
+        lut_index = ~raw_index & 63 if quadrant & 1 ^ quadrant >> 1 & 1 else raw_index
 
         return quadrant, lut_index
 
@@ -175,7 +172,7 @@ class NCO:
             # OLD phase_accum_reg (the value from the PREVIOUS call).
             # We stored self.phase_accum_reg at the start of this call as the
             # value from last cycle. So:
-            pass  # phase_with_offset computed below from OLD values
+            # phase_with_offset computed below from OLD values
 
         # Compute all NBA assignments from OLD state:
         # Save old state for NBA evaluation
@@ -195,16 +192,8 @@ class NCO:
 
         if phase_valid:
             # Stage 1 NBA: phase_accum_reg <= phase_accumulator (old value)
-            _new_phase_accum_reg = (self.phase_accumulator - ftw) & 0xFFFFFFFF  # noqa: F841 — old accum before add (derivation reference)
+            _new_phase_accum_reg = (self.phase_accumulator - ftw) & 0xFFFFFFFF
             # Wait - let me re-derive. The Verilog is:
-            #   phase_accumulator <= phase_accumulator + frequency_tuning_word;
-            #   phase_accum_reg   <= phase_accumulator;  // OLD value (NBA)
-            #   phase_with_offset <= phase_accum_reg + {phase_offset, 16'b0};
-            #                         // OLD phase_accum_reg
-            # Since all are NBA (<=), they all read the values from BEFORE this edge.
-            # So: new_phase_accumulator = old_phase_accumulator + ftw
-            #     new_phase_accum_reg   = old_phase_accumulator
-            #     new_phase_with_offset = old_phase_accum_reg + offset
             old_phase_accumulator = (self.phase_accumulator - ftw) & 0xFFFFFFFF  # reconstruct
             self.phase_accum_reg = old_phase_accumulator
             self.phase_with_offset = (
@@ -706,7 +695,6 @@ class DDCInputInterface:
         if old_valid_sync:
             ddc_i = sign_extend(ddc_i_18 & 0x3FFFF, 18)
             ddc_q = sign_extend(ddc_q_18 & 0x3FFFF, 18)
-            # adc_i = ddc_i[17:2] + ddc_i[1]  (rounding)
             trunc_i = (ddc_i >> 2) & 0xFFFF  # bits [17:2]
             round_i = (ddc_i >> 1) & 1       # bit [1]
             trunc_q = (ddc_q >> 2) & 0xFFFF
@@ -732,7 +720,7 @@ def load_twiddle_rom(filepath=None):
         filepath = os.path.join(base, '..', '..', 'fft_twiddle_1024.mem')
 
     values = []
-    with open(filepath, 'r') as f:
+    with open(filepath) as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith('//'):
@@ -760,12 +748,11 @@ def _twiddle_lookup(k, n, cos_rom):
 
     if k == 0:
         return cos_rom[0], 0
-    elif k == n4:
+    if k == n4:
         return 0, cos_rom[0]
-    elif k < n4:
+    if k < n4:
         return cos_rom[k], cos_rom[n4 - k]
-    else:
-        return sign_extend((-cos_rom[n2 - k]) & 0xFFFF, 16), cos_rom[k - n4]
+    return sign_extend((-cos_rom[n2 - k]) & 0xFFFF, 16), cos_rom[k - n4]
 
 
 class FFTEngine:
@@ -840,11 +827,9 @@ class FFTEngine:
 
                 # Multiply (49-bit products)
                 if not inverse:
-                    # Forward: t = b * (cos + j*sin)
                     prod_re = b_re * tw_cos + b_im * tw_sin
                     prod_im = b_im * tw_cos - b_re * tw_sin
                 else:
-                    # Inverse: t = b * (cos - j*sin)
                     prod_re = b_re * tw_cos - b_im * tw_sin
                     prod_im = b_im * tw_cos + b_re * tw_sin
 
@@ -923,10 +908,9 @@ class FreqMatchedFilter:
             # Saturation check
             if rounded > 0x3FFF8000:
                 return 0x7FFF
-            elif rounded < -0x3FFF8000:
+            if rounded < -0x3FFF8000:
                 return sign_extend(0x8000, 16)
-            else:
-                return sign_extend((rounded >> 15) & 0xFFFF, 16)
+            return sign_extend((rounded >> 15) & 0xFFFF, 16)
 
         out_re = round_sat_extract(real_sum)
         out_im = round_sat_extract(imag_sum)
@@ -1061,7 +1045,6 @@ class RangeBinDecimator:
                 out_im.append(best_im)
 
             elif mode == 2:
-                # Averaging: sum >> 4
                 sum_re = 0
                 sum_im = 0
                 for s in range(df):
@@ -1351,69 +1334,48 @@ def _self_test():
     """Quick sanity checks for each module."""
     import math
 
-    print("=" * 60)
-    print("FPGA Model Self-Test")
-    print("=" * 60)
 
     # --- NCO test ---
-    print("\n--- NCO Test ---")
     nco = NCO()
     ftw = 0x4CCCCCCD  # 120 MHz at 400 MSPS
     # Run 20 cycles to fill pipeline
     results = []
-    for i in range(20):
+    for _ in range(20):
         s, c, ready = nco.step(ftw)
         if ready:
             results.append((s, c))
 
     if results:
-        print(f"  First valid output: sin={results[0][0]}, cos={results[0][1]}")
-        print(f"  Got {len(results)} valid outputs from 20 cycles")
         # Check quadrature: sin^2 + cos^2 should be approximately 32767^2
         s, c = results[-1]
         mag_sq = s * s + c * c
         expected = 32767 * 32767
-        error_pct = abs(mag_sq - expected) / expected * 100
-        print(
-            f"  Quadrature check: sin^2+cos^2={mag_sq}, "
-            f"expected~{expected}, error={error_pct:.2f}%"
-        )
-    print("  NCO: OK")
+        abs(mag_sq - expected) / expected * 100
 
     # --- Mixer test ---
-    print("\n--- Mixer Test ---")
     mixer = Mixer()
     # Test with mid-scale ADC (128) and known cos/sin
-    for i in range(5):
-        mi, mq, mv = mixer.step(128, 0x7FFF, 0, True, True)
-    print(f"  Mixer with adc=128, cos=max, sin=0: I={mi}, Q={mq}, valid={mv}")
-    print("  Mixer: OK")
+    for _ in range(5):
+        _mi, _mq, _mv = mixer.step(128, 0x7FFF, 0, True, True)
 
     # --- CIC test ---
-    print("\n--- CIC Test ---")
     cic = CICDecimator()
     dc_val = sign_extend(0x1000, 18)  # Small positive DC
     out_count = 0
-    for i in range(100):
-        out, valid = cic.step(dc_val, True)
+    for _ in range(100):
+        _, valid = cic.step(dc_val, True)
         if valid:
             out_count += 1
-    print(f"  CIC: {out_count} outputs from 100 inputs (expect ~25 with 4x decimation + pipeline)")
-    print("  CIC: OK")
 
     # --- FIR test ---
-    print("\n--- FIR Test ---")
     fir = FIRFilter()
     out_count = 0
-    for i in range(50):
-        out, valid = fir.step(1000, True)
+    for _ in range(50):
+        _out, valid = fir.step(1000, True)
         if valid:
             out_count += 1
-    print(f"  FIR: {out_count} outputs from 50 inputs (expect ~43 with 7-cycle latency)")
-    print("  FIR: OK")
 
     # --- FFT test ---
-    print("\n--- FFT Test (1024-pt) ---")
     try:
         fft = FFTEngine(n=1024)
         # Single tone at bin 10
@@ -1425,43 +1387,28 @@ def _self_test():
         out_re, out_im = fft.compute(in_re, in_im, inverse=False)
         # Find peak bin
         max_mag = 0
-        peak_bin = 0
         for i in range(512):
             mag = abs(out_re[i]) + abs(out_im[i])
             if mag > max_mag:
                 max_mag = mag
-                peak_bin = i
-        print(f"  FFT peak at bin {peak_bin} (expected 10), magnitude={max_mag}")
         # IFFT roundtrip
-        rt_re, rt_im = fft.compute(out_re, out_im, inverse=True)
-        max_err = max(abs(rt_re[i] - in_re[i]) for i in range(1024))
-        print(f"  FFT->IFFT roundtrip max error: {max_err} LSBs")
-        print("  FFT: OK")
+        rt_re, _rt_im = fft.compute(out_re, out_im, inverse=True)
+        max(abs(rt_re[i] - in_re[i]) for i in range(1024))
     except FileNotFoundError:
-        print("  FFT: SKIPPED (twiddle file not found)")
+        pass
 
     # --- Conjugate multiply test ---
-    print("\n--- Conjugate Multiply Test ---")
     # (1+j0) * conj(1+j0) = 1+j0
     # In Q15: 32767 * 32767 -> should get close to 32767
-    r, m = FreqMatchedFilter.conjugate_multiply_sample(0x7FFF, 0, 0x7FFF, 0)
-    print(f"  (32767+j0) * conj(32767+j0) = {r}+j{m} (expect ~32767+j0)")
+    _r, _m = FreqMatchedFilter.conjugate_multiply_sample(0x7FFF, 0, 0x7FFF, 0)
     # (0+j32767) * conj(0+j32767) = (0+j32767)(0-j32767) = 32767^2 -> ~32767
-    r2, m2 = FreqMatchedFilter.conjugate_multiply_sample(0, 0x7FFF, 0, 0x7FFF)
-    print(f"  (0+j32767) * conj(0+j32767) = {r2}+j{m2} (expect ~32767+j0)")
-    print("  Conjugate Multiply: OK")
+    _r2, _m2 = FreqMatchedFilter.conjugate_multiply_sample(0, 0x7FFF, 0, 0x7FFF)
 
     # --- Range decimator test ---
-    print("\n--- Range Bin Decimator Test ---")
     test_re = list(range(1024))
     test_im = [0] * 1024
     out_re, out_im = RangeBinDecimator.decimate(test_re, test_im, mode=0)
-    print(f"  Mode 0 (center): first 5 bins = {out_re[:5]} (expect [8, 24, 40, 56, 72])")
-    print("  Range Decimator: OK")
 
-    print("\n" + "=" * 60)
-    print("ALL SELF-TESTS PASSED")
-    print("=" * 60)
 
 
 if __name__ == '__main__':

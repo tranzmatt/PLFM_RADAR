@@ -10,7 +10,7 @@ USB Interface: FT2232H USB 2.0 (8-bit, 50T production board) via pyftdi
 USB Packet Protocol (11-byte):
   TX (FPGA→Host):
     Data packet:  [0xAA] [range_q 2B] [range_i 2B] [dop_re 2B] [dop_im 2B] [det 1B] [0x55]
-    Status packet: [0xBB] [status 6×32b] [0x55]
+    Status packet: [0xBB] [status 6x32b] [0x55]
   RX (Host→FPGA):
     Command: 4 bytes received sequentially {opcode, addr, value_hi, value_lo}
 """
@@ -21,8 +21,9 @@ import time
 import threading
 import queue
 import logging
+import contextlib
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Any
 from enum import IntEnum
 
 
@@ -50,20 +51,36 @@ WATERFALL_DEPTH = 64
 
 
 class Opcode(IntEnum):
-    """Host register opcodes (matches radar_system_top.v command decode)."""
-    TRIGGER             = 0x01
-    PRF_DIV             = 0x02
-    NUM_CHIRPS          = 0x03
-    CHIRP_TIMER         = 0x04
-    STREAM_ENABLE       = 0x05
-    GAIN_SHIFT          = 0x06
-    THRESHOLD           = 0x10
+    """Host register opcodes — must match radar_system_top.v case(usb_cmd_opcode).
+
+    FPGA truth table (from radar_system_top.v lines 902-944):
+        0x01  host_radar_mode        0x14  host_short_listen_cycles
+        0x02  host_trigger_pulse     0x15  host_chirps_per_elev
+        0x03  host_detect_threshold  0x16  host_gain_shift
+        0x04  host_stream_control    0x20  host_range_mode
+        0x10  host_long_chirp_cycles 0x21-0x27  CFAR / MTI / DC-notch
+        0x11  host_long_listen_cycles 0x30  host_self_test_trigger
+        0x12  host_guard_cycles      0x31  host_status_request
+        0x13  host_short_chirp_cycles 0xFF  host_status_request
+    """
+    # --- Basic control (0x01-0x04) ---
+    RADAR_MODE          = 0x01  # 2-bit mode select
+    TRIGGER_PULSE       = 0x02  # self-clearing one-shot trigger
+    DETECT_THRESHOLD    = 0x03  # 16-bit detection threshold value
+    STREAM_CONTROL      = 0x04  # 3-bit stream enable mask
+
+    # --- Digital gain (0x16) ---
+    GAIN_SHIFT          = 0x16  # 4-bit digital gain shift
+
+    # --- Chirp timing (0x10-0x15) ---
     LONG_CHIRP          = 0x10
     LONG_LISTEN         = 0x11
     GUARD               = 0x12
     SHORT_CHIRP         = 0x13
     SHORT_LISTEN        = 0x14
     CHIRPS_PER_ELEV     = 0x15
+
+    # --- Signal processing (0x20-0x27) ---
     RANGE_MODE          = 0x20
     CFAR_GUARD          = 0x21
     CFAR_TRAIN          = 0x22
@@ -72,6 +89,8 @@ class Opcode(IntEnum):
     CFAR_ENABLE         = 0x25
     MTI_ENABLE          = 0x26
     DC_NOTCH_WIDTH      = 0x27
+
+    # --- Board self-test / status (0x30-0x31, 0xFF) ---
     SELF_TEST_TRIGGER   = 0x30
     SELF_TEST_STATUS    = 0x31
     STATUS_REQUEST      = 0xFF
@@ -83,7 +102,7 @@ class Opcode(IntEnum):
 
 @dataclass
 class RadarFrame:
-    """One complete radar frame (64 range × 32 Doppler)."""
+    """One complete radar frame (64 range x 32 Doppler)."""
     timestamp: float = 0.0
     range_doppler_i: np.ndarray = field(
         default_factory=lambda: np.zeros((NUM_RANGE_BINS, NUM_DOPPLER_BINS), dtype=np.int16))
@@ -101,7 +120,7 @@ class RadarFrame:
 
 @dataclass
 class StatusResponse:
-    """Parsed status response from FPGA (8-word packet as of Build 26)."""
+    """Parsed status response from FPGA (6-word / 26-byte packet)."""
     radar_mode: int = 0
     stream_ctrl: int = 0
     cfar_threshold: int = 0
@@ -144,7 +163,7 @@ class RadarProtocol:
         return struct.pack(">I", word)
 
     @staticmethod
-    def parse_data_packet(raw: bytes) -> Optional[Dict[str, Any]]:
+    def parse_data_packet(raw: bytes) -> dict[str, Any] | None:
         """
         Parse an 11-byte data packet from the FT2232H byte stream.
         Returns dict with keys: 'range_i', 'range_q', 'doppler_i', 'doppler_q',
@@ -181,10 +200,10 @@ class RadarProtocol:
         }
 
     @staticmethod
-    def parse_status_packet(raw: bytes) -> Optional[StatusResponse]:
+    def parse_status_packet(raw: bytes) -> StatusResponse | None:
         """
         Parse a status response packet.
-        Format: [0xBB] [6×4B status words] [0x55] = 1 + 24 + 1 = 26 bytes
+        Format: [0xBB] [6x4B status words] [0x55] = 1 + 24 + 1 = 26 bytes
         """
         if len(raw) < 26:
             return None
@@ -223,7 +242,7 @@ class RadarProtocol:
         return sr
 
     @staticmethod
-    def find_packet_boundaries(buf: bytes) -> List[Tuple[int, int, str]]:
+    def find_packet_boundaries(buf: bytes) -> list[tuple[int, int, str]]:
         """
         Scan buffer for packet start markers (0xAA data, 0xBB status).
         Returns list of (start_idx, expected_end_idx, packet_type).
@@ -233,19 +252,22 @@ class RadarProtocol:
         while i < len(buf):
             if buf[i] == HEADER_BYTE:
                 end = i + DATA_PACKET_SIZE
-                if end <= len(buf):
+                if end <= len(buf) and buf[end - 1] == FOOTER_BYTE:
                     packets.append((i, end, "data"))
                     i = end
                 else:
-                    break
+                    if end > len(buf):
+                        break  # partial packet at end — leave for residual
+                    i += 1  # footer mismatch — skip this false header
             elif buf[i] == STATUS_HEADER_BYTE:
-                # Status packet: 26 bytes (same for both interfaces)
                 end = i + STATUS_PACKET_SIZE
-                if end <= len(buf):
+                if end <= len(buf) and buf[end - 1] == FOOTER_BYTE:
                     packets.append((i, end, "status"))
                     i = end
                 else:
-                    break
+                    if end > len(buf):
+                        break  # partial status packet — leave for residual
+                    i += 1  # footer mismatch — skip
             else:
                 i += 1
         return packets
@@ -257,9 +279,13 @@ class RadarProtocol:
 
 # Optional pyftdi import
 try:
-    from pyftdi.ftdi import Ftdi as PyFtdi
+    from pyftdi.ftdi import Ftdi, FtdiError
+    PyFtdi = Ftdi
     PYFTDI_AVAILABLE = True
 except ImportError:
+    class FtdiError(Exception):
+        """Fallback FTDI error type when pyftdi is unavailable."""
+
     PYFTDI_AVAILABLE = False
 
 
@@ -306,20 +332,18 @@ class FT2232HConnection:
             self.is_open = True
             log.info(f"FT2232H device opened: {url}")
             return True
-        except Exception as e:
+        except FtdiError as e:
             log.error(f"FT2232H open failed: {e}")
             return False
 
     def close(self):
         if self._ftdi is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._ftdi.close()
-            except Exception:
-                pass
             self._ftdi = None
         self.is_open = False
 
-    def read(self, size: int = 4096) -> Optional[bytes]:
+    def read(self, size: int = 4096) -> bytes | None:
         """Read raw bytes from FT2232H. Returns None on error/timeout."""
         if not self.is_open:
             return None
@@ -331,7 +355,7 @@ class FT2232HConnection:
             try:
                 data = self._ftdi.read_data(size)
                 return bytes(data) if data else None
-            except Exception as e:
+            except FtdiError as e:
                 log.error(f"FT2232H read error: {e}")
                 return None
 
@@ -348,24 +372,29 @@ class FT2232HConnection:
             try:
                 written = self._ftdi.write_data(data)
                 return written == len(data)
-            except Exception as e:
+            except FtdiError as e:
                 log.error(f"FT2232H write error: {e}")
                 return False
 
     def _mock_read(self, size: int) -> bytes:
         """
-        Generate synthetic compact radar data packets (11-byte) for testing.
         Generate synthetic 11-byte radar data packets for testing.
-        Simulates a batch of packets with a target near range bin 20, Doppler bin 8.
+        Emits packets in sequential FPGA order (range_bin 0..63, doppler_bin
+        0..31 within each range bin) so that RadarAcquisition._ingest_sample()
+        places them correctly.  A target is injected near range bin 20,
+        Doppler bin 8.
         """
         time.sleep(0.05)
         self._mock_frame_num += 1
 
         buf = bytearray()
-        num_packets = min(32, size // DATA_PACKET_SIZE)
-        for _ in range(num_packets):
-            rbin = self._mock_rng.randint(0, NUM_RANGE_BINS)
-            dbin = self._mock_rng.randint(0, NUM_DOPPLER_BINS)
+        num_packets = min(NUM_CELLS, size // DATA_PACKET_SIZE)
+        start_idx = getattr(self, '_mock_seq_idx', 0)
+
+        for n in range(num_packets):
+            idx = (start_idx + n) % NUM_CELLS
+            rbin = idx // NUM_DOPPLER_BINS
+            dbin = idx % NUM_DOPPLER_BINS
 
             range_i = int(self._mock_rng.normal(0, 100))
             range_q = int(self._mock_rng.normal(0, 100))
@@ -393,6 +422,7 @@ class FT2232HConnection:
 
             buf += pkt
 
+        self._mock_seq_idx = (start_idx + num_packets) % NUM_CELLS
         return bytes(buf)
 
 
@@ -401,19 +431,19 @@ class FT2232HConnection:
 # ============================================================================
 
 # Hardware-only opcodes that cannot be adjusted in replay mode
+# Values must match radar_system_top.v case(usb_cmd_opcode).
 _HARDWARE_ONLY_OPCODES = {
-    0x01,  # TRIGGER
-    0x02,  # PRF_DIV
-    0x03,  # NUM_CHIRPS
-    0x04,  # CHIRP_TIMER
-    0x05,  # STREAM_ENABLE
-    0x06,  # GAIN_SHIFT
-    0x10,  # THRESHOLD / LONG_CHIRP
+    0x01,  # RADAR_MODE
+    0x02,  # TRIGGER_PULSE
+    0x03,  # DETECT_THRESHOLD
+    0x04,  # STREAM_CONTROL
+    0x10,  # LONG_CHIRP
     0x11,  # LONG_LISTEN
     0x12,  # GUARD
     0x13,  # SHORT_CHIRP
     0x14,  # SHORT_LISTEN
     0x15,  # CHIRPS_PER_ELEV
+    0x16,  # GAIN_SHIFT
     0x20,  # RANGE_MODE
     0x30,  # SELF_TEST_TRIGGER
     0x31,  # SELF_TEST_STATUS
@@ -439,26 +469,8 @@ def _saturate(val: int, bits: int) -> int:
     return max(max_neg, min(max_pos, int(val)))
 
 
-def _replay_mti(decim_i: np.ndarray, decim_q: np.ndarray,
-                enable: bool) -> Tuple[np.ndarray, np.ndarray]:
-    """Bit-accurate 2-pulse MTI canceller (matches mti_canceller.v)."""
-    n_chirps, n_bins = decim_i.shape
-    mti_i = np.zeros_like(decim_i)
-    mti_q = np.zeros_like(decim_q)
-    if not enable:
-        return decim_i.copy(), decim_q.copy()
-    for c in range(n_chirps):
-        if c == 0:
-            pass  # muted
-        else:
-            for r in range(n_bins):
-                mti_i[c, r] = _saturate(int(decim_i[c, r]) - int(decim_i[c - 1, r]), 16)
-                mti_q[c, r] = _saturate(int(decim_q[c, r]) - int(decim_q[c - 1, r]), 16)
-    return mti_i, mti_q
-
-
 def _replay_dc_notch(doppler_i: np.ndarray, doppler_q: np.ndarray,
-                     width: int) -> Tuple[np.ndarray, np.ndarray]:
+                     width: int) -> tuple[np.ndarray, np.ndarray]:
     """Bit-accurate DC notch filter (matches radar_system_top.v inline).
 
     Dual sub-frame notch: doppler_bin[4:0] = {sub_frame, bin[3:0]}.
@@ -480,7 +492,7 @@ def _replay_dc_notch(doppler_i: np.ndarray, doppler_q: np.ndarray,
 
 def _replay_cfar(doppler_i: np.ndarray, doppler_q: np.ndarray,
                  guard: int, train: int, alpha_q44: int,
-                 mode: int) -> Tuple[np.ndarray, np.ndarray]:
+                 mode: int) -> tuple[np.ndarray, np.ndarray]:
     """
     Bit-accurate CA-CFAR detector (matches cfar_ca.v).
     Returns (detect_flags, magnitudes) both (64, 32).
@@ -584,16 +596,16 @@ class ReplayConnection:
         self._cfar_mode: int = 0  # 0=CA, 1=GO, 2=SO
         self._cfar_enable: bool = True
         # Raw source arrays (loaded once, reprocessed on param change)
-        self._dop_mti_i: Optional[np.ndarray] = None
-        self._dop_mti_q: Optional[np.ndarray] = None
-        self._dop_nomti_i: Optional[np.ndarray] = None
-        self._dop_nomti_q: Optional[np.ndarray] = None
-        self._range_i_vec: Optional[np.ndarray] = None
-        self._range_q_vec: Optional[np.ndarray] = None
+        self._dop_mti_i: np.ndarray | None = None
+        self._dop_mti_q: np.ndarray | None = None
+        self._dop_nomti_i: np.ndarray | None = None
+        self._dop_nomti_q: np.ndarray | None = None
+        self._range_i_vec: np.ndarray | None = None
+        self._range_q_vec: np.ndarray | None = None
         # Rebuild flag
         self._needs_rebuild = False
 
-    def open(self, device_index: int = 0) -> bool:
+    def open(self, _device_index: int = 0) -> bool:
         try:
             self._load_arrays()
             self._packets = self._build_packets()
@@ -604,14 +616,14 @@ class ReplayConnection:
                      f"(MTI={'ON' if self._mti_enable else 'OFF'}, "
                      f"{self._frame_len} bytes/frame)")
             return True
-        except Exception as e:
+        except (OSError, ValueError, struct.error) as e:
             log.error(f"Replay open failed: {e}")
             return False
 
     def close(self):
         self.is_open = False
 
-    def read(self, size: int = 4096) -> Optional[bytes]:
+    def read(self, size: int = 4096) -> bytes | None:
         if not self.is_open:
             return None
         # Pace reads to target FPS (spread across ~64 reads per frame)
@@ -673,10 +685,9 @@ class ReplayConnection:
                     if self._mti_enable != new_en:
                         self._mti_enable = new_en
                         changed = True
-                elif opcode == 0x27:  # DC_NOTCH_WIDTH
-                    if self._dc_notch_width != value:
-                        self._dc_notch_width = value
-                        changed = True
+                elif opcode == 0x27 and self._dc_notch_width != value:  # DC_NOTCH_WIDTH
+                    self._dc_notch_width = value
+                    changed = True
                 if changed:
                     self._needs_rebuild = True
             if changed:
@@ -827,7 +838,7 @@ class DataRecorder:
             self._frame_count = 0
             self._recording = True
             log.info(f"Recording started: {filepath}")
-        except Exception as e:
+        except (OSError, ValueError) as e:
             log.error(f"Failed to start recording: {e}")
 
     def record_frame(self, frame: RadarFrame):
@@ -844,7 +855,7 @@ class DataRecorder:
             fg.create_dataset("detections", data=frame.detections, compression="gzip")
             fg.create_dataset("range_profile", data=frame.range_profile, compression="gzip")
             self._frame_count += 1
-        except Exception as e:
+        except (OSError, ValueError, TypeError) as e:
             log.error(f"Recording error: {e}")
 
     def stop(self):
@@ -853,7 +864,7 @@ class DataRecorder:
                 self._file.attrs["end_time"] = time.time()
                 self._file.attrs["total_frames"] = self._frame_count
                 self._file.close()
-            except Exception:
+            except (OSError, ValueError, RuntimeError):
                 pass
             self._file = None
         self._recording = False
@@ -871,7 +882,7 @@ class RadarAcquisition(threading.Thread):
     """
 
     def __init__(self, connection, frame_queue: queue.Queue,
-                 recorder: Optional[DataRecorder] = None,
+                 recorder: DataRecorder | None = None,
                  status_callback=None):
         super().__init__(daemon=True)
         self.conn = connection
@@ -888,13 +899,25 @@ class RadarAcquisition(threading.Thread):
 
     def run(self):
         log.info("Acquisition thread started")
+        residual = b""
         while not self._stop_event.is_set():
-            raw = self.conn.read(4096)
-            if raw is None or len(raw) == 0:
+            chunk = self.conn.read(4096)
+            if chunk is None or len(chunk) == 0:
                 time.sleep(0.01)
                 continue
 
+            raw = residual + chunk
             packets = RadarProtocol.find_packet_boundaries(raw)
+
+            # Keep unparsed tail bytes for next iteration
+            if packets:
+                last_end = packets[-1][1]
+                residual = raw[last_end:]
+            else:
+                # No packets found — keep entire buffer as residual
+                # but cap at 2x max packet size to avoid unbounded growth
+                max_residual = 2 * max(DATA_PACKET_SIZE, STATUS_PACKET_SIZE)
+                residual = raw[-max_residual:] if len(raw) > max_residual else raw
             for start, end, ptype in packets:
                 if ptype == "data":
                     parsed = RadarProtocol.parse_data_packet(
@@ -913,12 +936,12 @@ class RadarAcquisition(threading.Thread):
                         if self._status_callback is not None:
                             try:
                                 self._status_callback(status)
-                            except Exception as e:
+                            except Exception as e:  # noqa: BLE001
                                 log.error(f"Status callback error: {e}")
 
         log.info("Acquisition thread stopped")
 
-    def _ingest_sample(self, sample: Dict):
+    def _ingest_sample(self, sample: dict):
         """Place sample into current frame and emit when complete."""
         rbin = self._sample_idx // NUM_DOPPLER_BINS
         dbin = self._sample_idx % NUM_DOPPLER_BINS
@@ -948,10 +971,8 @@ class RadarAcquisition(threading.Thread):
         try:
             self.frame_queue.put_nowait(self._frame)
         except queue.Full:
-            try:
+            with contextlib.suppress(queue.Empty):
                 self.frame_queue.get_nowait()
-            except queue.Empty:
-                pass
             self.frame_queue.put_nowait(self._frame)
 
         if self.recorder and self.recorder.recording:

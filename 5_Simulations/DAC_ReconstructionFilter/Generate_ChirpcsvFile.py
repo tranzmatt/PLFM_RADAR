@@ -68,13 +68,7 @@ def generate_multi_ramp_csv(Fs=125e6, Tb=1e-6, Tau=2e-6, fmax=30e6, fmin=10e6,
     # --- Save CSV (no header)
     df = pd.DataFrame({"time(s)": t_csv, "voltage(V)": y_csv})
     df.to_csv(filename, index=False, header=False)
-    print(f"CSV saved: {filename}")
-    print(
-        f"Total raw samples: {total_samples} | Ramps inserted: {ramps_inserted} "
-        f"| CSV points: {len(y_csv)}"
-    )
 
-    # --- Plot (staircase)
     if show_plot or save_plot_png:
         # Choose plotting vectors (use raw DAC samples to keep lines crisp)
         t_plot = t
@@ -111,7 +105,6 @@ def generate_multi_ramp_csv(Fs=125e6, Tb=1e-6, Tau=2e-6, fmax=30e6, fmin=10e6,
 
         if save_plot_png:
             plt.savefig(save_plot_png, dpi=150)
-            print(f"Plot saved: {save_plot_png}")
         if show_plot:
             plt.show()
         else:

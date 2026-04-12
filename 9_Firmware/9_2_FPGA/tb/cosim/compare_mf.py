@@ -79,7 +79,7 @@ def load_csv(filepath):
     """Load CSV with columns (bin, out_i/range_profile_i, out_q/range_profile_q)."""
     vals_i = []
     vals_q = []
-    with open(filepath, 'r') as f:
+    with open(filepath) as f:
         f.readline()  # Skip header
         for line in f:
             line = line.strip()
@@ -93,17 +93,17 @@ def load_csv(filepath):
 
 def magnitude_spectrum(vals_i, vals_q):
     """Compute magnitude = |I| + |Q| for each bin (L1 norm, matches RTL)."""
-    return [abs(i) + abs(q) for i, q in zip(vals_i, vals_q)]
+    return [abs(i) + abs(q) for i, q in zip(vals_i, vals_q, strict=False)]
 
 
 def magnitude_l2(vals_i, vals_q):
     """Compute magnitude = sqrt(I^2 + Q^2) for each bin."""
-    return [math.sqrt(i*i + q*q) for i, q in zip(vals_i, vals_q)]
+    return [math.sqrt(i*i + q*q) for i, q in zip(vals_i, vals_q, strict=False)]
 
 
 def total_energy(vals_i, vals_q):
     """Compute total energy (sum of I^2 + Q^2)."""
-    return sum(i*i + q*q for i, q in zip(vals_i, vals_q))
+    return sum(i*i + q*q for i, q in zip(vals_i, vals_q, strict=False))
 
 
 def rms_magnitude(vals_i, vals_q):
@@ -111,7 +111,7 @@ def rms_magnitude(vals_i, vals_q):
     n = len(vals_i)
     if n == 0:
         return 0.0
-    return math.sqrt(sum(i*i + q*q for i, q in zip(vals_i, vals_q)) / n)
+    return math.sqrt(sum(i*i + q*q for i, q in zip(vals_i, vals_q, strict=False)) / n)
 
 
 def pearson_correlation(a, b):
@@ -144,7 +144,7 @@ def find_peak(vals_i, vals_q):
 def top_n_peaks(mags, n=10):
     """Find the top-N peak bins by magnitude. Returns set of bin indices."""
     indexed = sorted(enumerate(mags), key=lambda x: -x[1])
-    return set(idx for idx, _ in indexed[:n])
+    return {idx for idx, _ in indexed[:n]}
 
 
 def spectral_peak_overlap(mags_a, mags_b, n=10):
@@ -163,30 +163,20 @@ def spectral_peak_overlap(mags_a, mags_b, n=10):
 
 def compare_scenario(scenario_name, config, base_dir):
     """Compare one scenario. Returns (pass/fail, result_dict)."""
-    print(f"\n{'='*60}")
-    print(f"Scenario: {scenario_name} — {config['description']}")
-    print(f"{'='*60}")
 
     golden_path = os.path.join(base_dir, config['golden_csv'])
     rtl_path = os.path.join(base_dir, config['rtl_csv'])
 
     if not os.path.exists(golden_path):
-        print(f"  ERROR: Golden CSV not found: {golden_path}")
-        print("  Run: python3 gen_mf_cosim_golden.py")
         return False, {}
     if not os.path.exists(rtl_path):
-        print(f"  ERROR: RTL CSV not found: {rtl_path}")
-        print("  Run the RTL testbench first")
         return False, {}
 
     py_i, py_q = load_csv(golden_path)
     rtl_i, rtl_q = load_csv(rtl_path)
 
-    print(f"  Python model: {len(py_i)} samples")
-    print(f"  RTL output:   {len(rtl_i)} samples")
 
     if len(py_i) != FFT_SIZE or len(rtl_i) != FFT_SIZE:
-        print(f"  ERROR: Expected {FFT_SIZE} samples from each")
         return False, {}
 
     # ---- Metric 1: Energy ----
@@ -205,28 +195,17 @@ def compare_scenario(scenario_name, config, base_dir):
         energy_ratio = float('inf') if py_energy == 0 else 0.0
         rms_ratio = float('inf') if py_rms == 0 else 0.0
 
-    print("\n  Energy:")
-    print(f"    Python total energy:  {py_energy}")
-    print(f"    RTL total energy:     {rtl_energy}")
-    print(f"    Energy ratio (RTL/Py): {energy_ratio:.4f}")
-    print(f"    Python RMS:           {py_rms:.2f}")
-    print(f"    RTL RMS:              {rtl_rms:.2f}")
-    print(f"    RMS ratio (RTL/Py):   {rms_ratio:.4f}")
 
     # ---- Metric 2: Peak location ----
-    py_peak_bin, py_peak_mag = find_peak(py_i, py_q)
-    rtl_peak_bin, rtl_peak_mag = find_peak(rtl_i, rtl_q)
+    py_peak_bin, _py_peak_mag = find_peak(py_i, py_q)
+    rtl_peak_bin, _rtl_peak_mag = find_peak(rtl_i, rtl_q)
 
-    print("\n  Peak location:")
-    print(f"    Python: bin={py_peak_bin}, mag={py_peak_mag}")
-    print(f"    RTL:    bin={rtl_peak_bin}, mag={rtl_peak_mag}")
 
     # ---- Metric 3: Magnitude spectrum correlation ----
     py_mag = magnitude_l2(py_i, py_q)
     rtl_mag = magnitude_l2(rtl_i, rtl_q)
     mag_corr = pearson_correlation(py_mag, rtl_mag)
 
-    print(f"\n  Magnitude spectrum correlation: {mag_corr:.6f}")
 
     # ---- Metric 4: Top-N peak overlap ----
     # Use L1 magnitudes for peak finding (matches RTL)
@@ -235,16 +214,11 @@ def compare_scenario(scenario_name, config, base_dir):
     peak_overlap_10 = spectral_peak_overlap(py_mag_l1, rtl_mag_l1, n=10)
     peak_overlap_20 = spectral_peak_overlap(py_mag_l1, rtl_mag_l1, n=20)
 
-    print(f"  Top-10 peak overlap:   {peak_overlap_10:.2%}")
-    print(f"  Top-20 peak overlap:   {peak_overlap_20:.2%}")
 
     # ---- Metric 5: I and Q channel correlation ----
     corr_i = pearson_correlation(py_i, rtl_i)
     corr_q = pearson_correlation(py_q, rtl_q)
 
-    print("\n  Channel correlation:")
-    print(f"    I-channel: {corr_i:.6f}")
-    print(f"    Q-channel: {corr_q:.6f}")
 
     # ---- Pass/Fail Decision ----
     # The SIMULATION branch uses floating-point twiddles ($cos/$sin) while
@@ -278,11 +252,8 @@ def compare_scenario(scenario_name, config, base_dir):
                     energy_ok))
 
     # Print checks
-    print("\n  Pass/Fail Checks:")
     all_pass = True
-    for name, passed in checks:
-        status = "PASS" if passed else "FAIL"
-        print(f"    [{status}] {name}")
+    for _name, passed in checks:
         if not passed:
             all_pass = False
 
@@ -310,7 +281,6 @@ def compare_scenario(scenario_name, config, base_dir):
             f.write(f'{k},{py_i[k]},{py_q[k]},{rtl_i[k]},{rtl_q[k]},'
                     f'{py_mag_l1[k]},{rtl_mag_l1[k]},'
                     f'{rtl_i[k]-py_i[k]},{rtl_q[k]-py_q[k]}\n')
-    print(f"\n  Detailed comparison: {compare_csv}")
 
     return all_pass, result
 
@@ -322,25 +292,15 @@ def compare_scenario(scenario_name, config, base_dir):
 def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    if len(sys.argv) > 1:
-        arg = sys.argv[1].lower()
-    else:
-        arg = 'chirp'
+    arg = sys.argv[1].lower() if len(sys.argv) > 1 else 'chirp'
 
     if arg == 'all':
         run_scenarios = list(SCENARIOS.keys())
     elif arg in SCENARIOS:
         run_scenarios = [arg]
     else:
-        print(f"Unknown scenario: {arg}")
-        print(f"Valid: {', '.join(SCENARIOS.keys())}, all")
         sys.exit(1)
 
-    print("=" * 60)
-    print("Matched Filter Co-Simulation Comparison")
-    print("RTL (synthesis branch) vs Python model (bit-accurate)")
-    print(f"Scenarios: {', '.join(run_scenarios)}")
-    print("=" * 60)
 
     results = []
     for name in run_scenarios:
@@ -348,37 +308,20 @@ def main():
         results.append((name, passed, result))
 
     # Summary
-    print(f"\n{'='*60}")
-    print("SUMMARY")
-    print(f"{'='*60}")
 
-    print(f"\n  {'Scenario':<12} {'Energy Ratio':>13} {'Mag Corr':>10} "
-          f"{'Peak Ovlp':>10} {'Py Peak':>8} {'RTL Peak':>9} {'Status':>8}")
-    print(f"  {'-'*12} {'-'*13} {'-'*10} {'-'*10} {'-'*8} {'-'*9} {'-'*8}")
 
     all_pass = True
-    for name, passed, result in results:
+    for _name, passed, result in results:
         if not result:
-            print(f"  {name:<12} {'ERROR':>13} {'—':>10} {'—':>10} "
-                  f"{'—':>8} {'—':>9} {'FAIL':>8}")
             all_pass = False
         else:
-            status = "PASS" if passed else "FAIL"
-            print(f"  {name:<12} {result['energy_ratio']:>13.4f} "
-                  f"{result['mag_corr']:>10.4f} "
-                  f"{result['peak_overlap_10']:>9.0%} "
-                  f"{result['py_peak_bin']:>8d} "
-                  f"{result['rtl_peak_bin']:>9d} "
-                  f"{status:>8}")
             if not passed:
                 all_pass = False
 
-    print()
     if all_pass:
-        print("ALL TESTS PASSED")
+        pass
     else:
-        print("SOME TESTS FAILED")
-    print(f"{'='*60}")
+        pass
 
     sys.exit(0 if all_pass else 1)
 

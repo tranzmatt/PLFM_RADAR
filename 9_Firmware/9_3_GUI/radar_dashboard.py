@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AERIS-10 Radar Dashboard — Board Bring-Up Edition
+AERIS-10 Radar Dashboard
 ===================================================
 Real-time visualization and control for the AERIS-10 phased-array radar
 via FT2232H USB 2.0 interface.
@@ -10,7 +10,8 @@ Features:
   - Real-time range-Doppler magnitude heatmap (64x32)
   - CFAR detection overlay (flagged cells highlighted)
   - Range profile waterfall plot (range vs. time)
-  - Host command sender (opcodes 0x01-0x27, 0x30, 0xFF)
+  - Host command sender (opcodes per radar_system_top.v:
+    0x01-0x04, 0x10-0x16, 0x20-0x27, 0x30-0x31, 0xFF)
   - Configuration panel for all radar parameters
   - HDF5 data recording for offline analysis
   - Mock mode for development/testing without hardware
@@ -27,7 +28,7 @@ import queue
 import logging
 import argparse
 import threading
-from typing import Optional, Dict
+import contextlib
 from collections import deque
 
 import numpy as np
@@ -82,18 +83,19 @@ class RadarDashboard:
     C = 3e8                  # m/s — speed of light
 
     def __init__(self, root: tk.Tk, connection: FT2232HConnection,
-                 recorder: DataRecorder):
+                 recorder: DataRecorder, device_index: int = 0):
         self.root = root
         self.conn = connection
         self.recorder = recorder
+        self.device_index = device_index
 
-        self.root.title("AERIS-10 Radar Dashboard — Bring-Up Edition")
+        self.root.title("AERIS-10 Radar Dashboard")
         self.root.geometry("1600x950")
         self.root.configure(bg=BG)
 
         # Frame queue (acquisition → display)
         self.frame_queue: queue.Queue[RadarFrame] = queue.Queue(maxsize=8)
-        self._acq_thread: Optional[RadarAcquisition] = None
+        self._acq_thread: RadarAcquisition | None = None
 
         # Display state
         self._current_frame = RadarFrame()
@@ -154,7 +156,7 @@ class RadarDashboard:
         self.btn_record = ttk.Button(top, text="Record", command=self._on_record)
         self.btn_record.pack(side="right", padx=4)
 
-        # Notebook (tabs)
+        # -- Tabbed notebook layout --
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -173,9 +175,8 @@ class RadarDashboard:
         # Compute physical axis limits
         # Range resolution: dR = c / (2 * BW) per range bin
         # But we decimate 1024→64 bins, so each bin spans 16 FFT bins.
-        # Range per FFT bin = c / (2 * BW) * (Fs / FFT_SIZE) — simplified:
-        #   max_range = c * Fs / (4 * BW) for Fs-sampled baseband
-        #   range_per_bin = max_range / NUM_RANGE_BINS
+        # Range resolution derivation: c/(2*BW) gives ~0.3 m per FFT bin.
+        # After 1024-to-64 decimation each displayed range bin spans 16 FFT bins.
         range_res = self.C / (2.0 * self.BANDWIDTH)  # ~0.3 m per FFT bin
         # After decimation 1024→64, each range bin = 16 FFT bins
         range_per_bin = range_res * 16
@@ -232,39 +233,92 @@ class RadarDashboard:
         self._canvas = canvas
 
     def _build_control_tab(self, parent):
-        """Host command sender and configuration panel."""
-        outer = ttk.Frame(parent)
-        outer.pack(fill="both", expand=True, padx=16, pady=16)
+        """Host command sender — organized by FPGA register groups.
 
-        # Left column: Quick actions
-        left = ttk.LabelFrame(outer, text="Quick Actions", padding=12)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        Layout: scrollable canvas with three columns:
+          Left:   Quick Actions + Diagnostics (self-test)
+          Center: Waveform Timing + Signal Processing
+          Right:  Detection (CFAR) + Custom Command
+        """
+        # Scrollable wrapper for small screens
+        canvas = tk.Canvas(parent, bg=BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        outer = ttk.Frame(canvas)
+        outer.bind("<Configure>",
+                   lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=outer, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        scrollbar.pack(side="right", fill="y")
 
-        ttk.Button(left, text="Trigger Chirp (0x01)",
-                   command=lambda: self._send_cmd(0x01, 1)).pack(fill="x", pady=3)
-        ttk.Button(left, text="Enable MTI (0x26)",
-                   command=lambda: self._send_cmd(0x26, 1)).pack(fill="x", pady=3)
-        ttk.Button(left, text="Disable MTI (0x26)",
-                   command=lambda: self._send_cmd(0x26, 0)).pack(fill="x", pady=3)
-        ttk.Button(left, text="Enable CFAR (0x25)",
-                   command=lambda: self._send_cmd(0x25, 1)).pack(fill="x", pady=3)
-        ttk.Button(left, text="Disable CFAR (0x25)",
-                   command=lambda: self._send_cmd(0x25, 0)).pack(fill="x", pady=3)
-        ttk.Button(left, text="Request Status (0xFF)",
-                   command=lambda: self._send_cmd(0xFF, 0)).pack(fill="x", pady=3)
+        self._param_vars: dict[str, tk.StringVar] = {}
 
-        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=6)
+        # ── Left column: Quick Actions + Diagnostics ──────────────────
+        left = ttk.Frame(outer)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 
-        ttk.Label(left, text="FPGA Self-Test", font=("Menlo", 10, "bold")).pack(
-            anchor="w", pady=(2, 0))
-        ttk.Button(left, text="Run Self-Test (0x30)",
-                   command=lambda: self._send_cmd(0x30, 1)).pack(fill="x", pady=3)
-        ttk.Button(left, text="Read Self-Test Result (0x31)",
-                   command=lambda: self._send_cmd(0x31, 0)).pack(fill="x", pady=3)
+        # -- Radar Operation --
+        grp_op = ttk.LabelFrame(left, text="Radar Operation", padding=10)
+        grp_op.pack(fill="x", pady=(0, 8))
 
-        # Self-test result display
-        st_frame = ttk.LabelFrame(left, text="Self-Test Results", padding=6)
-        st_frame.pack(fill="x", pady=(6, 0))
+        ttk.Button(grp_op, text="Radar Mode On",
+                   command=lambda: self._send_cmd(0x01, 1)).pack(fill="x", pady=2)
+        ttk.Button(grp_op, text="Radar Mode Off",
+                   command=lambda: self._send_cmd(0x01, 0)).pack(fill="x", pady=2)
+        ttk.Button(grp_op, text="Trigger Chirp",
+                   command=lambda: self._send_cmd(0x02, 1)).pack(fill="x", pady=2)
+
+        # Stream Control (3-bit mask)
+        sc_row = ttk.Frame(grp_op)
+        sc_row.pack(fill="x", pady=2)
+        ttk.Label(sc_row, text="Stream Control").pack(side="left")
+        var_sc = tk.StringVar(value="7")
+        self._param_vars["4"] = var_sc
+        ttk.Entry(sc_row, textvariable=var_sc, width=6).pack(side="left", padx=6)
+        ttk.Label(sc_row, text="0-7", foreground=ACCENT,
+                  font=("Menlo", 9)).pack(side="left")
+        ttk.Button(sc_row, text="Set",
+                   command=lambda: self._send_validated(
+                       0x04, var_sc, bits=3)).pack(side="right")
+
+        ttk.Button(grp_op, text="Request Status",
+                   command=lambda: self._send_cmd(0xFF, 0)).pack(fill="x", pady=2)
+
+        # -- Signal Processing --
+        grp_sp = ttk.LabelFrame(left, text="Signal Processing", padding=10)
+        grp_sp.pack(fill="x", pady=(0, 8))
+
+        sp_params = [
+            # Format: label, opcode, default, bits, hint
+            ("Detect Threshold",  0x03, "10000", 16, "0-65535"),
+            ("Gain Shift",        0x16, "0",     4,  "0-15, dir+shift"),
+            ("MTI Enable",        0x26, "0",     1,  "0=off, 1=on"),
+            ("DC Notch Width",    0x27, "0",     3,  "0-7 bins"),
+        ]
+        for label, opcode, default, bits, hint in sp_params:
+            self._add_param_row(grp_sp, label, opcode, default, bits, hint)
+
+        # MTI quick toggle
+        mti_row = ttk.Frame(grp_sp)
+        mti_row.pack(fill="x", pady=2)
+        ttk.Button(mti_row, text="Enable MTI",
+                   command=lambda: self._send_cmd(0x26, 1)).pack(
+                       side="left", expand=True, fill="x", padx=(0, 2))
+        ttk.Button(mti_row, text="Disable MTI",
+                   command=lambda: self._send_cmd(0x26, 0)).pack(
+                       side="left", expand=True, fill="x", padx=(2, 0))
+
+        # -- Diagnostics --
+        grp_diag = ttk.LabelFrame(left, text="Diagnostics", padding=10)
+        grp_diag.pack(fill="x", pady=(0, 8))
+
+        ttk.Button(grp_diag, text="Run Self-Test",
+                   command=lambda: self._send_cmd(0x30, 1)).pack(fill="x", pady=2)
+        ttk.Button(grp_diag, text="Read Self-Test Result",
+                   command=lambda: self._send_cmd(0x31, 0)).pack(fill="x", pady=2)
+
+        st_frame = ttk.LabelFrame(grp_diag, text="Self-Test Results", padding=6)
+        st_frame.pack(fill="x", pady=(4, 0))
         self._st_labels = {}
         for name, default_text in [
             ("busy", "Busy: --"),
@@ -280,58 +334,107 @@ class RadarDashboard:
             lbl.pack(anchor="w")
             self._st_labels[name] = lbl
 
-        # Right column: Parameter configuration
-        right = ttk.LabelFrame(outer, text="Parameter Configuration", padding=12)
-        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        # ── Center column: Waveform Timing ────────────────────────────
+        center = ttk.Frame(outer)
+        center.grid(row=0, column=1, sticky="nsew", padx=6)
 
-        self._param_vars: Dict[str, tk.StringVar] = {}
-        params = [
-            ("CFAR Guard (0x21)", 0x21, "2"),
-            ("CFAR Train (0x22)", 0x22, "8"),
-            ("CFAR Alpha Q4.4 (0x23)", 0x23, "48"),
-            ("CFAR Mode (0x24)", 0x24, "0"),
-            ("Threshold (0x10)", 0x10, "500"),
-            ("Gain Shift (0x06)", 0x06, "0"),
-            ("DC Notch Width (0x27)", 0x27, "0"),
-            ("Range Mode (0x20)", 0x20, "0"),
-            ("Stream Enable (0x05)", 0x05, "7"),
+        grp_wf = ttk.LabelFrame(center, text="Waveform Timing", padding=10)
+        grp_wf.pack(fill="x", pady=(0, 8))
+
+        wf_params = [
+            ("Long Chirp Cycles",   0x10, "3000",  16, "0-65535, rst=3000"),
+            ("Long Listen Cycles",  0x11, "13700", 16, "0-65535, rst=13700"),
+            ("Guard Cycles",        0x12, "17540", 16, "0-65535, rst=17540"),
+            ("Short Chirp Cycles",  0x13, "50",    16, "0-65535, rst=50"),
+            ("Short Listen Cycles", 0x14, "17450", 16, "0-65535, rst=17450"),
+            ("Chirps Per Elevation", 0x15, "32",    6, "1-32, clamped"),
         ]
+        for label, opcode, default, bits, hint in wf_params:
+            self._add_param_row(grp_wf, label, opcode, default, bits, hint)
 
-        for row_idx, (label, opcode, default) in enumerate(params):
-            ttk.Label(right, text=label).grid(row=row_idx, column=0,
-                                               sticky="w", pady=2)
-            var = tk.StringVar(value=default)
-            self._param_vars[str(opcode)] = var
-            ent = ttk.Entry(right, textvariable=var, width=10)
-            ent.grid(row=row_idx, column=1, padx=8, pady=2)
-            ttk.Button(
-                right, text="Set",
-                command=lambda op=opcode, v=var: self._send_cmd(op, int(v.get()))
-            ).grid(row=row_idx, column=2, pady=2)
+        # ── Right column: Detection (CFAR) + Custom ───────────────────
+        right = ttk.Frame(outer)
+        right.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
 
-        # Custom command
-        ttk.Separator(right, orient="horizontal").grid(
-            row=len(params), column=0, columnspan=3, sticky="ew", pady=8)
+        grp_cfar = ttk.LabelFrame(right, text="Detection (CFAR)", padding=10)
+        grp_cfar.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(right, text="Custom Opcode (hex)").grid(
-            row=len(params) + 1, column=0, sticky="w")
+        cfar_params = [
+            ("CFAR Enable",       0x25, "0",  1,  "0=off, 1=on"),
+            ("CFAR Guard Cells",  0x21, "2",  4,  "0-15, rst=2"),
+            ("CFAR Train Cells",  0x22, "8",  5,  "1-31, rst=8"),
+            ("CFAR Alpha (Q4.4)", 0x23, "48", 8,  "0-255, rst=0x30=3.0"),
+            ("CFAR Mode",         0x24, "0",  2,  "0=CA 1=GO 2=SO"),
+        ]
+        for label, opcode, default, bits, hint in cfar_params:
+            self._add_param_row(grp_cfar, label, opcode, default, bits, hint)
+
+        # CFAR quick toggle
+        cfar_row = ttk.Frame(grp_cfar)
+        cfar_row.pack(fill="x", pady=2)
+        ttk.Button(cfar_row, text="Enable CFAR",
+                   command=lambda: self._send_cmd(0x25, 1)).pack(
+                       side="left", expand=True, fill="x", padx=(0, 2))
+        ttk.Button(cfar_row, text="Disable CFAR",
+                   command=lambda: self._send_cmd(0x25, 0)).pack(
+                       side="left", expand=True, fill="x", padx=(2, 0))
+
+        # ── Custom Command (advanced / debug) ─────────────────────────
+        grp_cust = ttk.LabelFrame(right, text="Custom Command", padding=10)
+        grp_cust.pack(fill="x", pady=(0, 8))
+
+        r0 = ttk.Frame(grp_cust)
+        r0.pack(fill="x", pady=2)
+        ttk.Label(r0, text="Opcode (hex)").pack(side="left")
         self._custom_op = tk.StringVar(value="01")
-        ttk.Entry(right, textvariable=self._custom_op, width=10).grid(
-            row=len(params) + 1, column=1, padx=8)
+        ttk.Entry(r0, textvariable=self._custom_op, width=8).pack(
+            side="left", padx=6)
 
-        ttk.Label(right, text="Value (dec)").grid(
-            row=len(params) + 2, column=0, sticky="w")
+        r1 = ttk.Frame(grp_cust)
+        r1.pack(fill="x", pady=2)
+        ttk.Label(r1, text="Value (dec)").pack(side="left")
         self._custom_val = tk.StringVar(value="0")
-        ttk.Entry(right, textvariable=self._custom_val, width=10).grid(
-            row=len(params) + 2, column=1, padx=8)
+        ttk.Entry(r1, textvariable=self._custom_val, width=8).pack(
+            side="left", padx=6)
 
-        ttk.Button(right, text="Send Custom",
-                   command=self._send_custom).grid(
-            row=len(params) + 2, column=2, pady=2)
+        ttk.Button(grp_cust, text="Send",
+                   command=self._send_custom).pack(fill="x", pady=2)
 
+        # Column weights
         outer.columnconfigure(0, weight=1)
-        outer.columnconfigure(1, weight=2)
+        outer.columnconfigure(1, weight=1)
+        outer.columnconfigure(2, weight=1)
         outer.rowconfigure(0, weight=1)
+
+    def _add_param_row(self, parent, label: str, opcode: int,
+                       default: str, bits: int, hint: str):
+        """Add a single parameter row: label, entry, hint, Set button with validation."""
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text=label).pack(side="left")
+        var = tk.StringVar(value=default)
+        self._param_vars[str(opcode)] = var
+        ttk.Entry(row, textvariable=var, width=8).pack(side="left", padx=6)
+        ttk.Label(row, text=hint, foreground=ACCENT,
+                  font=("Menlo", 9)).pack(side="left")
+        ttk.Button(row, text="Set",
+                   command=lambda: self._send_validated(
+                       opcode, var, bits=bits)).pack(side="right")
+
+    def _send_validated(self, opcode: int, var: tk.StringVar, bits: int):
+        """Parse, clamp to bit-width, send command, and update the entry."""
+        try:
+            raw = int(var.get())
+        except ValueError:
+            log.error(f"Invalid value for opcode 0x{opcode:02X}: {var.get()!r}")
+            return
+        max_val = (1 << bits) - 1
+        clamped = max(0, min(raw, max_val))
+        if clamped != raw:
+            log.warning(f"Value {raw} clamped to {clamped} "
+                        f"({bits}-bit max={max_val}) for opcode 0x{opcode:02X}")
+            var.set(str(clamped))
+        self._send_cmd(opcode, clamped)
 
     def _build_log_tab(self, parent):
         self.log_text = tk.Text(parent, bg=BG2, fg=FG, font=("Menlo", 10),
@@ -364,7 +467,7 @@ class RadarDashboard:
         self.root.update_idletasks()
 
         def _do_connect():
-            ok = self.conn.open()
+            ok = self.conn.open(self.device_index)
             # Schedule UI update back on the main thread
             self.root.after(0, lambda: self._on_connect_done(ok))
 
@@ -530,10 +633,8 @@ class _TextHandler(logging.Handler):
 
     def emit(self, record):
         msg = self.format(record)
-        try:
+        with contextlib.suppress(Exception):
             self._text.after(0, self._append, msg)
-        except Exception:
-            pass
 
     def _append(self, msg: str):
         self._text.insert("end", msg + "\n")
@@ -578,7 +679,7 @@ def main():
 
     root = tk.Tk()
 
-    dashboard = RadarDashboard(root, conn, recorder)
+    dashboard = RadarDashboard(root, conn, recorder, device_index=args.device)
 
     if args.record:
         filepath = os.path.join(

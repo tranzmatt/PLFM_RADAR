@@ -2,24 +2,39 @@
 v7.workers — QThread-based workers and demo target simulator.
 
 Classes:
-  - RadarDataWorker  — reads from FT2232HQ, parses packets,
-                       emits signals with processed data.
+  - RadarDataWorker  — reads from FT2232H via production RadarAcquisition,
+                       parses 0xAA/0xBB packets, assembles 64x32 frames,
+                       runs host-side DSP, emits PyQt signals.
   - GPSDataWorker    — reads GPS frames from STM32 CDC, emits GPSData signals.
-  - TargetSimulator  — QTimer-based demo target generator (from GUI_PyQt_Map.py).
+  - TargetSimulator  — QTimer-based demo target generator.
+
+The old V6/V7 packet parsing (sync A5 C3 + type + CRC16) has been removed.
+All packet parsing now uses the production radar_protocol.py which matches
+the actual FPGA packet format (0xAA data 11-byte, 0xBB status 26-byte).
 """
 
 import math
 import time
 import random
+import queue
+import struct
 import logging
-from typing import List
+
+import numpy as np
 
 from PyQt6.QtCore import QThread, QObject, QTimer, pyqtSignal
 
-from .models import RadarTarget, RadarSettings, GPSData
-from .hardware import FT2232HQInterface, STM32USBInterface
+from .models import RadarTarget, GPSData, RadarSettings
+from .hardware import (
+    RadarAcquisition,
+    RadarFrame,
+    StatusResponse,
+    DataRecorder,
+    STM32USBInterface,
+)
 from .processing import (
-    RadarProcessor, RadarPacketParser, USBPacketParser,
+    RadarProcessor,
+    USBPacketParser,
     apply_pitch_correction,
 )
 
@@ -61,162 +76,196 @@ def polar_to_geographic(
 
 
 # =============================================================================
-# Radar Data Worker (QThread)
+# Radar Data Worker (QThread) — production protocol
 # =============================================================================
 
 class RadarDataWorker(QThread):
     """
-    Background worker that continuously reads radar data from the primary
-    FT2232HQ interface, parses packets, runs the processing pipeline, and
-    emits signals with results.
+    Background worker that reads radar data from FT2232H (or ReplayConnection),
+    parses 0xAA/0xBB packets via production RadarAcquisition, runs optional
+    host-side DSP, and emits PyQt signals with results.
+
+    This replaces the old V7 worker which used an incompatible packet format.
+    Now uses production radar_protocol.py for all packet parsing and frame
+    assembly (11-byte 0xAA data packets → 64x32 RadarFrame).
 
     Signals:
-        packetReceived(dict)     — a single parsed packet dict
-        targetsUpdated(list)     — list of RadarTarget after processing
-        errorOccurred(str)       — error message
-        statsUpdated(dict)       — packet/byte counters
+        frameReady(RadarFrame)    — a complete 64x32 radar frame
+        statusReceived(object)    — StatusResponse from FPGA
+        targetsUpdated(list)      — list of RadarTarget after host-side DSP
+        errorOccurred(str)        — error message
+        statsUpdated(dict)        — frame/byte counters
     """
 
-    packetReceived = pyqtSignal(dict)
-    targetsUpdated = pyqtSignal(list)
+    frameReady = pyqtSignal(object)       # RadarFrame
+    statusReceived = pyqtSignal(object)   # StatusResponse
+    targetsUpdated = pyqtSignal(list)     # List[RadarTarget]
     errorOccurred = pyqtSignal(str)
     statsUpdated = pyqtSignal(dict)
 
     def __init__(
         self,
-        ft2232hq: FT2232HQInterface,
-        processor: RadarProcessor,
-        packet_parser: RadarPacketParser,
-        settings: RadarSettings,
-        gps_data_ref: GPSData,
+        connection,  # FT2232HConnection or ReplayConnection
+        processor: RadarProcessor | None = None,
+        recorder: DataRecorder | None = None,
+        gps_data_ref: GPSData | None = None,
+        settings: RadarSettings | None = None,
         parent=None,
     ):
         super().__init__(parent)
-        self._ft2232hq = ft2232hq
+        self._connection = connection
         self._processor = processor
-        self._parser = packet_parser
-        self._settings = settings
+        self._recorder = recorder
         self._gps = gps_data_ref
+        self._settings = settings or RadarSettings()
         self._running = False
 
+        # Frame queue for production RadarAcquisition → this thread
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=4)
+
+        # Production acquisition thread (does the actual parsing)
+        self._acquisition: RadarAcquisition | None = None
+
         # Counters
-        self._packet_count = 0
+        self._frame_count = 0
         self._byte_count = 0
         self._error_count = 0
 
     def stop(self):
         self._running = False
+        if self._acquisition:
+            self._acquisition.stop()
 
     def run(self):
-        """Main loop: read → parse → process → emit."""
+        """
+        Start production RadarAcquisition thread, then poll its frame queue
+        and emit PyQt signals for each complete frame.
+        """
         self._running = True
-        buffer = bytearray()
+
+        # Create and start the production acquisition thread
+        self._acquisition = RadarAcquisition(
+            connection=self._connection,
+            frame_queue=self._frame_queue,
+            recorder=self._recorder,
+            status_callback=self._on_status,
+        )
+        self._acquisition.start()
+        logger.info("RadarDataWorker started (production protocol)")
 
         while self._running:
-            # Use FT2232HQ interface
-            iface = None
-            if self._ft2232hq and self._ft2232hq.is_open:
-                iface = self._ft2232hq
-
-            if iface is None:
-                self.msleep(100)
-                continue
-
             try:
-                data = iface.read_data(4096)
-                if data:
-                    buffer.extend(data)
-                    self._byte_count += len(data)
+                # Poll for complete frames from production acquisition
+                frame: RadarFrame = self._frame_queue.get(timeout=0.1)
+                self._frame_count += 1
 
-                    # Parse as many packets as possible
-                    while len(buffer) >= 6:
-                        result = self._parser.parse_packet(bytes(buffer))
-                        if result is None:
-                            # No valid packet at current position — skip one byte
-                            if len(buffer) > 1:
-                                buffer = buffer[1:]
-                            else:
-                                break
-                            continue
+                # Emit raw frame
+                self.frameReady.emit(frame)
 
-                        pkt, consumed = result
-                        buffer = buffer[consumed:]
-                        self._packet_count += 1
+                # Run host-side DSP if processor is configured
+                if self._processor is not None:
+                    targets = self._run_host_dsp(frame)
+                    if targets:
+                        self.targetsUpdated.emit(targets)
 
-                        # Process the packet
-                        self._process_packet(pkt)
-                        self.packetReceived.emit(pkt)
+                # Emit stats
+                self.statsUpdated.emit({
+                    "frames": self._frame_count,
+                    "detection_count": frame.detection_count,
+                    "errors": self._error_count,
+                })
 
-                    # Emit stats periodically
-                    self.statsUpdated.emit({
-                        "packets": self._packet_count,
-                        "bytes": self._byte_count,
-                        "errors": self._error_count,
-                        "active_tracks": len(self._processor.tracks),
-                        "targets": len(self._processor.detected_targets),
-                    })
-                else:
-                    self.msleep(10)
-            except Exception as e:
+            except queue.Empty:
+                continue
+            except (ValueError, IndexError) as e:
                 self._error_count += 1
                 self.errorOccurred.emit(str(e))
                 logger.error(f"RadarDataWorker error: {e}")
-                self.msleep(100)
 
-    # ---- internal packet handling ------------------------------------------
+        # Stop acquisition thread
+        if self._acquisition:
+            self._acquisition.stop()
+            self._acquisition.join(timeout=2.0)
+            self._acquisition = None
 
-    def _process_packet(self, pkt: dict):
-        """Route a parsed packet through the processing pipeline."""
-        try:
-            if pkt["type"] == "range":
-                range_m = pkt["range"] * 0.1
-                raw_elev = pkt["elevation"]
+        logger.info("RadarDataWorker stopped")
+
+    def _on_status(self, status: StatusResponse):
+        """Callback from production RadarAcquisition on status packet."""
+        self.statusReceived.emit(status)
+
+    def _run_host_dsp(self, frame: RadarFrame) -> list[RadarTarget]:
+        """
+        Run host-side DSP on a complete frame.
+        This is where DBSCAN clustering, Kalman tracking, and other
+        non-timing-critical processing happens.
+
+        The FPGA already does: FFT, MTI, CFAR, DC notch.
+        Host-side DSP adds: clustering, tracking, geo-coordinate mapping.
+
+        Bin-to-physical conversion uses RadarSettings.range_resolution
+        and velocity_resolution (should be calibrated to actual waveform).
+        """
+        targets: list[RadarTarget] = []
+
+        cfg = self._processor.config
+        if not (cfg.clustering_enabled or cfg.tracking_enabled):
+            return targets
+
+        # Extract detections from FPGA CFAR flags
+        det_indices = np.argwhere(frame.detections > 0)
+        r_res = self._settings.range_resolution
+        v_res = self._settings.velocity_resolution
+
+        for idx in det_indices:
+            rbin, dbin = idx
+            mag = frame.magnitude[rbin, dbin]
+            snr = 10 * np.log10(max(mag, 1)) if mag > 0 else 0
+
+            # Convert bin indices to physical units
+            range_m = float(rbin) * r_res
+            # Doppler: centre bin (16) = 0 m/s; positive bins = approaching
+            velocity_ms = float(dbin - 16) * v_res
+
+            # Apply pitch correction if GPS data available
+            raw_elev = 0.0  # FPGA doesn't send elevation per-detection
+            corr_elev = raw_elev
+            if self._gps:
                 corr_elev = apply_pitch_correction(raw_elev, self._gps.pitch)
 
-                target = RadarTarget(
-                    id=pkt["chirp"],
-                    range=range_m,
-                    velocity=0,
-                    azimuth=pkt["azimuth"],
-                    elevation=corr_elev,
-                    snr=20.0,
-                    timestamp=pkt["timestamp"],
+            # Compute geographic position if GPS available
+            lat, lon = 0.0, 0.0
+            azimuth = 0.0  # No azimuth from single-beam; set to heading
+            if self._gps:
+                azimuth = self._gps.heading
+                lat, lon = polar_to_geographic(
+                    self._gps.latitude, self._gps.longitude,
+                    range_m, azimuth,
                 )
-                self._update_rdm(target)
 
-            elif pkt["type"] == "doppler":
-                lam = 3e8 / self._settings.system_frequency
-                velocity = (pkt["doppler_real"] / 32767.0) * (
-                    self._settings.prf1 * lam / 2
-                )
-                self._update_velocity(pkt, velocity)
+            target = RadarTarget(
+                id=len(targets),
+                range=range_m,
+                velocity=velocity_ms,
+                azimuth=azimuth,
+                elevation=corr_elev,
+                latitude=lat,
+                longitude=lon,
+                snr=snr,
+                timestamp=frame.timestamp,
+            )
+            targets.append(target)
 
-            elif pkt["type"] == "detection":
-                if pkt["detected"]:
-                    raw_elev = pkt["elevation"]
-                    corr_elev = apply_pitch_correction(raw_elev, self._gps.pitch)
-                    logger.info(
-                        f"CFAR Detection: raw={raw_elev}, corr={corr_elev:.1f}, "
-                        f"pitch={self._gps.pitch:.1f}"
-                    )
-        except Exception as e:
-            logger.error(f"Error processing packet: {e}")
+        # DBSCAN clustering
+        if cfg.clustering_enabled and len(targets) > 0:
+            clusters = self._processor.clustering(
+                targets, cfg.clustering_eps, cfg.clustering_min_samples)
+            # Associate and track
+            if cfg.tracking_enabled:
+                targets = self._processor.association(targets, clusters)
+                self._processor.tracking(targets)
 
-    def _update_rdm(self, target: RadarTarget):
-        range_bin = min(int(target.range / 50), 1023)
-        doppler_bin = min(abs(int(target.velocity)), 31)
-        self._processor.range_doppler_map[range_bin, doppler_bin] += 1
-        self._processor.detected_targets.append(target)
-        if len(self._processor.detected_targets) > 100:
-            self._processor.detected_targets = self._processor.detected_targets[-100:]
-
-    def _update_velocity(self, pkt: dict, velocity: float):
-        for t in self._processor.detected_targets:
-            if (t.azimuth == pkt["azimuth"]
-                    and t.elevation == pkt["elevation"]
-                    and t.id == pkt["chirp"]):
-                t.velocity = velocity
-                break
+        return targets
 
 
 # =============================================================================
@@ -269,7 +318,7 @@ class GPSDataWorker(QThread):
                     if gps:
                         self._gps_count += 1
                         self.gpsReceived.emit(gps)
-            except Exception as e:
+            except (ValueError, struct.error) as e:
                 self.errorOccurred.emit(str(e))
                 logger.error(f"GPSDataWorker error: {e}")
             self.msleep(100)
@@ -292,7 +341,7 @@ class TargetSimulator(QObject):
     def __init__(self, radar_position: GPSData, parent=None):
         super().__init__(parent)
         self._radar_pos = radar_position
-        self._targets: List[RadarTarget] = []
+        self._targets: list[RadarTarget] = []
         self._next_id = 1
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -349,7 +398,7 @@ class TargetSimulator(QObject):
 
     def _tick(self):
         """Update all simulated targets and emit."""
-        updated: List[RadarTarget] = []
+        updated: list[RadarTarget] = []
 
         for t in self._targets:
             new_range = t.range - t.velocity * 0.5

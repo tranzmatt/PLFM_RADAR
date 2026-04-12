@@ -1,31 +1,40 @@
 """
 v7.dashboard — Main application window for the PLFM Radar GUI V7.
 
-RadarDashboard is a QMainWindow with four tabs:
-  1. Main View   — Range-Doppler matplotlib canvas, device combos, Start/Stop, targets table
-  2. Map View    — Embedded Leaflet map + sidebar (position, coverage, demo, target info)
-  3. Diagnostics — Connection indicators, packet stats, dependency status, log viewer
-  4. Settings    — All radar parameters + About section
+RadarDashboard is a QMainWindow with five tabs:
+  1. Main View   — Range-Doppler matplotlib canvas (64x32), device combos,
+                   Start/Stop, targets table
+  2. Map View    — Embedded Leaflet map + sidebar
+  3. FPGA Control — Full FPGA register control panel (all 22 opcodes,
+                    bit-width validation, grouped layout matching production)
+  4. Diagnostics — Connection indicators, packet stats, dependency status,
+                   self-test results, log viewer
+  5. Settings    — Host-side DSP parameters + About section
 
-Integrates: hardware interfaces, QThread workers, TargetSimulator, RadarMapWidget.
+Uses production radar_protocol.py for all FPGA communication:
+  - FT2232HConnection for real hardware
+  - ReplayConnection for offline .npy replay
+  - Mock mode (FT2232HConnection(mock=True)) for development
+
+The old STM32 magic-packet start flow has been removed. FPGA registers
+are controlled directly via 4-byte {opcode, addr, value_hi, value_lo}
+commands sent over FT2232H.
 """
 
 import time
 import logging
-from typing import List, Optional
 
 import numpy as np
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QTabWidget, QSplitter, QGroupBox, QFrame,
+    QTabWidget, QSplitter, QGroupBox, QFrame, QScrollArea,
     QLabel, QPushButton, QComboBox, QCheckBox,
-    QDoubleSpinBox, QSpinBox,
+    QDoubleSpinBox, QSpinBox, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QPlainTextEdit, QStatusBar, QMessageBox,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
-from PyQt6.QtGui import QColor
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -37,14 +46,26 @@ from .models import (
     DARK_TREEVIEW, DARK_TREEVIEW_ALT,
     DARK_SUCCESS, DARK_WARNING, DARK_ERROR, DARK_INFO,
     USB_AVAILABLE, FTDI_AVAILABLE, SCIPY_AVAILABLE,
-    SKLEARN_AVAILABLE, FILTERPY_AVAILABLE, CRCMOD_AVAILABLE,
+    SKLEARN_AVAILABLE, FILTERPY_AVAILABLE,
 )
-from .hardware import FT2232HQInterface, STM32USBInterface
-from .processing import RadarProcessor, RadarPacketParser, USBPacketParser
+from .hardware import (
+    FT2232HConnection,
+    ReplayConnection,
+    RadarProtocol,
+    RadarFrame,
+    StatusResponse,
+    DataRecorder,
+    STM32USBInterface,
+)
+from .processing import RadarProcessor, USBPacketParser
 from .workers import RadarDataWorker, GPSDataWorker, TargetSimulator
 from .map_widget import RadarMapWidget
 
 logger = logging.getLogger(__name__)
+
+# Frame dimensions from FPGA
+NUM_RANGE_BINS = 64
+NUM_DOPPLER_BINS = 32
 
 
 # =============================================================================
@@ -52,19 +73,19 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 class RangeDopplerCanvas(FigureCanvasQTAgg):
-    """Matplotlib canvas showing the Range-Doppler map with dark theme."""
+    """Matplotlib canvas showing the 64x32 Range-Doppler map with dark theme."""
 
-    def __init__(self, parent=None):
+    def __init__(self, _parent=None):
         fig = Figure(figsize=(10, 6), facecolor=DARK_BG)
         self.ax = fig.add_subplot(111, facecolor=DARK_ACCENT)
 
-        self._data = np.zeros((1024, 32))
+        self._data = np.zeros((NUM_RANGE_BINS, NUM_DOPPLER_BINS))
         self.im = self.ax.imshow(
             self._data, aspect="auto", cmap="hot",
-            extent=[0, 32, 0, 1024], origin="lower",
+            extent=[0, NUM_DOPPLER_BINS, 0, NUM_RANGE_BINS], origin="lower",
         )
 
-        self.ax.set_title("Range-Doppler Map (Pitch Corrected)", color=DARK_FG)
+        self.ax.set_title("Range-Doppler Map (64x32)", color=DARK_FG)
         self.ax.set_xlabel("Doppler Bin", color=DARK_FG)
         self.ax.set_ylabel("Range Bin", color=DARK_FG)
         self.ax.tick_params(colors=DARK_FG)
@@ -74,8 +95,9 @@ class RangeDopplerCanvas(FigureCanvasQTAgg):
         fig.tight_layout()
         super().__init__(fig)
 
-    def update_map(self, rdm: np.ndarray):
-        display = np.log10(rdm + 1)
+    def update_map(self, magnitude: np.ndarray, _detections: np.ndarray = None):
+        """Update the heatmap with new magnitude data."""
+        display = np.log10(magnitude + 1)
         self.im.set_data(display)
         self.im.set_clim(vmin=display.min(), vmax=max(display.max(), 0.1))
         self.draw_idle()
@@ -86,11 +108,11 @@ class RangeDopplerCanvas(FigureCanvasQTAgg):
 # =============================================================================
 
 class RadarDashboard(QMainWindow):
-    """Main application window with 4 tabs."""
+    """Main application window with 5 tabs."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("PLFM Radar System GUI V7 — PyQt6")
+        self.setWindowTitle("AERIS-10 Radar System V7 — PyQt6")
         self.setGeometry(100, 60, 1500, 950)
 
         # ---- Core objects --------------------------------------------------
@@ -100,33 +122,36 @@ class RadarDashboard(QMainWindow):
             altitude=0.0, pitch=0.0, heading=0.0, timestamp=0.0,
         )
 
-        # Hardware interfaces
+        # Hardware interfaces — production protocol
+        self._connection: FT2232HConnection | None = None
         self._stm32 = STM32USBInterface()
-        self._ft2232hq = FT2232HQInterface()
+        self._recorder = DataRecorder()
 
         # Processing
         self._processor = RadarProcessor()
-        self._radar_parser = RadarPacketParser()
         self._usb_parser = USBPacketParser()
         self._processing_config = ProcessingConfig()
 
-        # Device lists (cached for index lookup)
+        # Device lists
         self._stm32_devices: list = []
-        self._ft2232hq_devices: list = []
 
         # Workers (created on demand)
-        self._radar_worker: Optional[RadarDataWorker] = None
-        self._gps_worker: Optional[GPSDataWorker] = None
-        self._simulator: Optional[TargetSimulator] = None
+        self._radar_worker: RadarDataWorker | None = None
+        self._gps_worker: GPSDataWorker | None = None
+        self._simulator: TargetSimulator | None = None
 
         # State
         self._running = False
         self._demo_mode = False
         self._start_time = time.time()
-        self._radar_stats: dict = {}
+        self._current_frame: RadarFrame | None = None
+        self._last_status: StatusResponse | None = None
+        self._frame_count = 0
         self._gps_packet_count = 0
-        self._current_targets: List[RadarTarget] = []
-        self._corrected_elevations: list = []
+        self._current_targets: list[RadarTarget] = []
+
+        # FPGA control parameter widgets
+        self._param_spins: dict = {}  # opcode_hex -> QSpinBox
 
         # ---- Build UI ------------------------------------------------------
         self._apply_dark_theme()
@@ -143,7 +168,7 @@ class RadarDashboard(QMainWindow):
         self._log_handler.setLevel(logging.INFO)
         logging.getLogger().addHandler(self._log_handler)
 
-        logger.info("RadarDashboard initialised")
+        logger.info("RadarDashboard initialised (production protocol)")
 
     # =====================================================================
     # Dark theme
@@ -280,6 +305,7 @@ class RadarDashboard(QMainWindow):
 
         self._create_main_tab()
         self._create_map_tab()
+        self._create_fpga_control_tab()
         self._create_diagnostics_tab()
         self._create_settings_tab()
 
@@ -298,16 +324,17 @@ class RadarDashboard(QMainWindow):
         ctrl_layout = QGridLayout(ctrl)
         ctrl_layout.setContentsMargins(8, 6, 8, 6)
 
-        # Row 0: device combos & buttons
-        ctrl_layout.addWidget(QLabel("STM32 USB:"), 0, 0)
+        # Row 0: connection mode + device combos + buttons
+        ctrl_layout.addWidget(QLabel("Mode:"), 0, 0)
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItems(["Mock", "Live FT2232H", "Replay (.npy)"])
+        self._mode_combo.setCurrentIndex(0)
+        ctrl_layout.addWidget(self._mode_combo, 0, 1)
+
+        ctrl_layout.addWidget(QLabel("STM32 GPS:"), 0, 2)
         self._stm32_combo = QComboBox()
         self._stm32_combo.setMinimumWidth(200)
-        ctrl_layout.addWidget(self._stm32_combo, 0, 1)
-
-        ctrl_layout.addWidget(QLabel("FT2232HQ (Primary):"), 0, 2)
-        self._ft2232hq_combo = QComboBox()
-        self._ft2232hq_combo.setMinimumWidth(200)
-        ctrl_layout.addWidget(self._ft2232hq_combo, 0, 3)
+        ctrl_layout.addWidget(self._stm32_combo, 0, 3)
 
         refresh_btn = QPushButton("Refresh Devices")
         refresh_btn.clicked.connect(self._refresh_devices)
@@ -319,7 +346,7 @@ class RadarDashboard(QMainWindow):
             f"QPushButton:hover {{ background-color: #66BB6A; }}"
         )
         self._start_btn.clicked.connect(self._start_radar)
-        ctrl_layout.addWidget(self._start_btn, 0, 8)
+        ctrl_layout.addWidget(self._start_btn, 0, 7)
 
         self._stop_btn = QPushButton("Stop Radar")
         self._stop_btn.setEnabled(False)
@@ -328,7 +355,7 @@ class RadarDashboard(QMainWindow):
             f"QPushButton:hover {{ background-color: #EF5350; }}"
         )
         self._stop_btn.clicked.connect(self._stop_radar)
-        ctrl_layout.addWidget(self._stop_btn, 0, 9)
+        ctrl_layout.addWidget(self._stop_btn, 0, 8)
 
         self._demo_btn_main = QPushButton("Start Demo")
         self._demo_btn_main.setStyleSheet(
@@ -336,18 +363,18 @@ class RadarDashboard(QMainWindow):
             f"QPushButton:hover {{ background-color: #42A5F5; }}"
         )
         self._demo_btn_main.clicked.connect(self._toggle_demo_main)
-        ctrl_layout.addWidget(self._demo_btn_main, 0, 10)
+        ctrl_layout.addWidget(self._demo_btn_main, 0, 9)
 
         # Row 1: status labels
         self._gps_label = QLabel("GPS: Waiting for data...")
-        ctrl_layout.addWidget(self._gps_label, 1, 0, 1, 4)
+        ctrl_layout.addWidget(self._gps_label, 1, 0, 1, 3)
 
         self._pitch_label = QLabel("Pitch: --.--\u00b0")
-        ctrl_layout.addWidget(self._pitch_label, 1, 4, 1, 2)
+        ctrl_layout.addWidget(self._pitch_label, 1, 3, 1, 2)
 
         self._status_label_main = QLabel("Status: Ready")
         self._status_label_main.setAlignment(Qt.AlignmentFlag.AlignRight)
-        ctrl_layout.addWidget(self._status_label_main, 1, 6, 1, 5)
+        ctrl_layout.addWidget(self._status_label_main, 1, 5, 1, 5)
 
         layout.addWidget(ctrl)
 
@@ -359,14 +386,13 @@ class RadarDashboard(QMainWindow):
         display_splitter.addWidget(self._rdm_canvas)
 
         # Targets table
-        targets_group = QGroupBox("Detected Targets (Pitch Corrected)")
+        targets_group = QGroupBox("Detected Targets")
         tg_layout = QVBoxLayout(targets_group)
 
         self._targets_table_main = QTableWidget()
-        self._targets_table_main.setColumnCount(7)
+        self._targets_table_main.setColumnCount(5)
         self._targets_table_main.setHorizontalHeaderLabels([
-            "Track ID", "Range (m)", "Velocity (m/s)",
-            "Azimuth", "Raw Elev", "Corr Elev", "SNR (dB)",
+            "Range Bin", "Doppler Bin", "Magnitude", "SNR (dB)", "Track ID",
         ])
         self._targets_table_main.setAlternatingRowColors(True)
         self._targets_table_main.setSelectionBehavior(
@@ -489,7 +515,233 @@ class RadarDashboard(QMainWindow):
         self._tabs.addTab(tab, "Map View")
 
     # -----------------------------------------------------------------
-    # TAB 3: Diagnostics
+    # TAB 3: FPGA Control (production register map)
+    # -----------------------------------------------------------------
+
+    def _create_fpga_control_tab(self):
+        """FPGA register control panel — all 22 opcodes with validation.
+
+        Layout: 3-column scrollable:
+          Left:   Radar Operation + Signal Processing + Diagnostics
+          Center: Waveform Timing
+          Right:  Detection (CFAR) + Custom Command
+        """
+        tab = QWidget()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        inner = QWidget()
+        outer_layout = QHBoxLayout(inner)
+        outer_layout.setContentsMargins(8, 8, 8, 8)
+        outer_layout.setSpacing(12)
+
+        # ── Left column ──────────────────────────────────────────────
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        # -- Radar Operation --
+        grp_op = QGroupBox("Radar Operation")
+        op_layout = QVBoxLayout(grp_op)
+
+        btn_mode_on = QPushButton("Radar Mode On")
+        btn_mode_on.clicked.connect(lambda: self._send_fpga_cmd(0x01, 1))
+        op_layout.addWidget(btn_mode_on)
+
+        btn_mode_off = QPushButton("Radar Mode Off")
+        btn_mode_off.clicked.connect(lambda: self._send_fpga_cmd(0x01, 0))
+        op_layout.addWidget(btn_mode_off)
+
+        btn_trigger = QPushButton("Trigger Chirp")
+        btn_trigger.clicked.connect(lambda: self._send_fpga_cmd(0x02, 1))
+        op_layout.addWidget(btn_trigger)
+
+        # Stream Control (3-bit mask)
+        self._add_fpga_param_row(op_layout, "Stream Control", 0x04, 7, 3,
+                                 "0-7, 3-bit mask, rst=7")
+
+        btn_status = QPushButton("Request Status")
+        btn_status.clicked.connect(lambda: self._send_fpga_cmd(0xFF, 0))
+        op_layout.addWidget(btn_status)
+
+        left_layout.addWidget(grp_op)
+
+        # -- Signal Processing --
+        grp_sp = QGroupBox("Signal Processing")
+        sp_layout = QVBoxLayout(grp_sp)
+
+        sp_params = [
+            ("Detect Threshold",  0x03, 10000, 16, "0-65535, rst=10000"),
+            ("Gain Shift",        0x16, 0,     4,  "0-15, dir+shift"),
+            ("MTI Enable",        0x26, 0,     1,  "0=off, 1=on"),
+            ("DC Notch Width",    0x27, 0,     3,  "0-7 bins"),
+        ]
+        for label, opcode, default, bits, hint in sp_params:
+            self._add_fpga_param_row(sp_layout, label, opcode, default, bits, hint)
+
+        # MTI quick toggles
+        mti_row = QHBoxLayout()
+        btn_mti_on = QPushButton("Enable MTI")
+        btn_mti_on.clicked.connect(lambda: self._send_fpga_cmd(0x26, 1))
+        mti_row.addWidget(btn_mti_on)
+        btn_mti_off = QPushButton("Disable MTI")
+        btn_mti_off.clicked.connect(lambda: self._send_fpga_cmd(0x26, 0))
+        mti_row.addWidget(btn_mti_off)
+        sp_layout.addLayout(mti_row)
+
+        left_layout.addWidget(grp_sp)
+
+        # -- Diagnostics --
+        grp_diag = QGroupBox("Diagnostics")
+        diag_layout = QVBoxLayout(grp_diag)
+
+        btn_selftest = QPushButton("Run Self-Test")
+        btn_selftest.clicked.connect(lambda: self._send_fpga_cmd(0x30, 1))
+        diag_layout.addWidget(btn_selftest)
+
+        btn_selftest_read = QPushButton("Read Self-Test Result")
+        btn_selftest_read.clicked.connect(lambda: self._send_fpga_cmd(0x31, 0))
+        diag_layout.addWidget(btn_selftest_read)
+
+        # Self-test result labels
+        st_group = QGroupBox("Self-Test Results")
+        st_layout = QVBoxLayout(st_group)
+        self._st_labels = {}
+        for name, default_text in [
+            ("busy", "Busy: --"),
+            ("flags", "Flags: -----"),
+            ("detail", "Detail: 0x--"),
+            ("t0", "T0 BRAM: --"),
+            ("t1", "T1 CIC:  --"),
+            ("t2", "T2 FFT:  --"),
+            ("t3", "T3 Arith: --"),
+            ("t4", "T4 ADC:  --"),
+        ]:
+            lbl = QLabel(default_text)
+            lbl.setStyleSheet("font-family: 'Courier New', monospace; font-size: 11px;")
+            st_layout.addWidget(lbl)
+            self._st_labels[name] = lbl
+        diag_layout.addWidget(st_group)
+
+        left_layout.addWidget(grp_diag)
+        left_layout.addStretch()
+        outer_layout.addWidget(left, stretch=1)
+
+        # ── Center column: Waveform Timing ────────────────────────────
+        center = QWidget()
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+
+        grp_wf = QGroupBox("Waveform Timing")
+        wf_layout = QVBoxLayout(grp_wf)
+
+        wf_params = [
+            ("Long Chirp Cycles",   0x10, 3000,  16, "0-65535, rst=3000"),
+            ("Long Listen Cycles",  0x11, 13700, 16, "0-65535, rst=13700"),
+            ("Guard Cycles",        0x12, 17540, 16, "0-65535, rst=17540"),
+            ("Short Chirp Cycles",  0x13, 50,    16, "0-65535, rst=50"),
+            ("Short Listen Cycles", 0x14, 17450, 16, "0-65535, rst=17450"),
+            ("Chirps Per Elevation", 0x15, 32,    6, "1-32, clamped"),
+        ]
+        for label, opcode, default, bits, hint in wf_params:
+            self._add_fpga_param_row(wf_layout, label, opcode, default, bits, hint)
+
+        center_layout.addWidget(grp_wf)
+        center_layout.addStretch()
+        outer_layout.addWidget(center, stretch=1)
+
+        # ── Right column: Detection (CFAR) + Custom Command ───────────
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        grp_cfar = QGroupBox("Detection (CFAR)")
+        cfar_layout = QVBoxLayout(grp_cfar)
+
+        cfar_params = [
+            ("CFAR Enable",       0x25, 0,  1,  "0=off, 1=on"),
+            ("CFAR Guard Cells",  0x21, 2,  4,  "0-15, rst=2"),
+            ("CFAR Train Cells",  0x22, 8,  5,  "1-31, rst=8"),
+            ("CFAR Alpha (Q4.4)", 0x23, 48, 8,  "0-255, rst=0x30=3.0"),
+            ("CFAR Mode",         0x24, 0,  2,  "0=CA 1=GO 2=SO"),
+        ]
+        for label, opcode, default, bits, hint in cfar_params:
+            self._add_fpga_param_row(cfar_layout, label, opcode, default, bits, hint)
+
+        # CFAR quick toggles
+        cfar_row = QHBoxLayout()
+        btn_cfar_on = QPushButton("Enable CFAR")
+        btn_cfar_on.clicked.connect(lambda: self._send_fpga_cmd(0x25, 1))
+        cfar_row.addWidget(btn_cfar_on)
+        btn_cfar_off = QPushButton("Disable CFAR")
+        btn_cfar_off.clicked.connect(lambda: self._send_fpga_cmd(0x25, 0))
+        cfar_row.addWidget(btn_cfar_off)
+        cfar_layout.addLayout(cfar_row)
+
+        right_layout.addWidget(grp_cfar)
+
+        # Custom Command
+        grp_custom = QGroupBox("Custom Command")
+        cust_layout = QGridLayout(grp_custom)
+
+        cust_layout.addWidget(QLabel("Opcode (hex):"), 0, 0)
+        self._custom_opcode = QLineEdit("01")
+        self._custom_opcode.setMaximumWidth(80)
+        cust_layout.addWidget(self._custom_opcode, 0, 1)
+
+        cust_layout.addWidget(QLabel("Value (dec):"), 1, 0)
+        self._custom_value = QLineEdit("0")
+        self._custom_value.setMaximumWidth(80)
+        cust_layout.addWidget(self._custom_value, 1, 1)
+
+        btn_send_custom = QPushButton("Send")
+        btn_send_custom.clicked.connect(self._send_custom_command)
+        cust_layout.addWidget(btn_send_custom, 2, 0, 1, 2)
+
+        right_layout.addWidget(grp_custom)
+        right_layout.addStretch()
+        outer_layout.addWidget(right, stretch=1)
+
+        scroll.setWidget(inner)
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll)
+
+        self._tabs.addTab(tab, "FPGA Control")
+
+    def _add_fpga_param_row(self, parent_layout: QVBoxLayout, label: str,
+                            opcode: int, default: int, bits: int, hint: str):
+        """Add a single FPGA parameter row: label + spinbox + hint + Set button."""
+        row = QHBoxLayout()
+
+        lbl = QLabel(label)
+        lbl.setMinimumWidth(140)
+        row.addWidget(lbl)
+
+        max_val = (1 << bits) - 1
+        spin = QSpinBox()
+        spin.setRange(0, max_val)
+        spin.setValue(default)
+        spin.setMinimumWidth(80)
+        row.addWidget(spin)
+        self._param_spins[f"0x{opcode:02X}"] = spin
+
+        hint_lbl = QLabel(hint)
+        hint_lbl.setStyleSheet(f"color: {DARK_INFO}; font-size: 10px;")
+        row.addWidget(hint_lbl)
+
+        btn = QPushButton("Set")
+        btn.setMaximumWidth(60)
+        # Capture opcode and spin by value
+        btn.clicked.connect(lambda _, op=opcode, sp=spin, b=bits:
+                            self._send_fpga_validated(op, sp.value(), b))
+        row.addWidget(btn)
+
+        parent_layout.addLayout(row)
+
+    # -----------------------------------------------------------------
+    # TAB 4: Diagnostics
     # -----------------------------------------------------------------
 
     def _create_diagnostics_tab(self):
@@ -503,24 +755,23 @@ class RadarDashboard(QMainWindow):
         conn_group = QGroupBox("Connection Status")
         conn_layout = QGridLayout(conn_group)
 
+        self._conn_ft2232h = self._make_status_label("FT2232H")
         self._conn_stm32 = self._make_status_label("STM32 USB")
-        self._conn_ft2232hq = self._make_status_label("FT2232HQ (Primary)")
 
-        conn_layout.addWidget(QLabel("STM32 USB:"), 0, 0)
-        conn_layout.addWidget(self._conn_stm32, 0, 1)
-        conn_layout.addWidget(QLabel("FT2232HQ:"), 1, 0)
-        conn_layout.addWidget(self._conn_ft2232hq, 1, 1)
+        conn_layout.addWidget(QLabel("FT2232H:"), 0, 0)
+        conn_layout.addWidget(self._conn_ft2232h, 0, 1)
+        conn_layout.addWidget(QLabel("STM32 USB:"), 1, 0)
+        conn_layout.addWidget(self._conn_stm32, 1, 1)
 
         top_row.addWidget(conn_group)
 
-        # Packet statistics
-        stats_group = QGroupBox("Packet Statistics")
+        # Frame statistics
+        stats_group = QGroupBox("Statistics")
         stats_layout = QGridLayout(stats_group)
 
         labels = [
-            "Radar Packets:", "Bytes Received:", "GPS Packets:",
-            "Errors:", "Active Tracks:", "Detected Targets:",
-            "Uptime:", "Packet Rate:",
+            "Frames:", "Detections:", "GPS Packets:",
+            "Errors:", "Uptime:", "Frame Rate:",
         ]
         self._diag_values: list = []
         for i, text in enumerate(labels):
@@ -533,6 +784,17 @@ class RadarDashboard(QMainWindow):
 
         top_row.addWidget(stats_group)
 
+        # FPGA Status readback
+        fpga_group = QGroupBox("FPGA Status Readback")
+        fpga_layout = QVBoxLayout(fpga_group)
+        self._fpga_status_label = QLabel("No status received yet")
+        self._fpga_status_label.setWordWrap(True)
+        self._fpga_status_label.setStyleSheet(
+            "font-family: 'Courier New', monospace; font-size: 11px; padding: 4px;")
+        fpga_layout.addWidget(self._fpga_status_label)
+
+        top_row.addWidget(fpga_group)
+
         # Dependency status
         dep_group = QGroupBox("Optional Dependencies")
         dep_layout = QGridLayout(dep_group)
@@ -543,7 +805,6 @@ class RadarDashboard(QMainWindow):
             ("scipy", SCIPY_AVAILABLE),
             ("sklearn", SKLEARN_AVAILABLE),
             ("filterpy", FILTERPY_AVAILABLE),
-            ("crcmod", CRCMOD_AVAILABLE),
         ]
         for i, (name, avail) in enumerate(deps):
             dep_layout.addWidget(QLabel(name), i, 0)
@@ -577,12 +838,10 @@ class RadarDashboard(QMainWindow):
         self._tabs.addTab(tab, "Diagnostics")
 
     # -----------------------------------------------------------------
-    # TAB 4: Settings
+    # TAB 5: Settings (host-side DSP)
     # -----------------------------------------------------------------
 
     def _create_settings_tab(self):
-        from PyQt6.QtWidgets import QScrollArea
-
         tab = QWidget()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -592,183 +851,22 @@ class RadarDashboard(QMainWindow):
         layout = QVBoxLayout(inner)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        # ---- Radar parameters group ----------------------------------------
-        radar_group = QGroupBox("Radar Parameters")
-        r_layout = QGridLayout(radar_group)
-
-        self._setting_spins: dict = {}
-        param_defs = [
-            ("System Frequency (GHz):", "system_frequency", 1, 100, 2,
-             self._settings.system_frequency / 1e9, " GHz"),
-            ("Chirp Duration 1 (us):", "chirp_duration_1", 0.01, 10000, 2,
-             self._settings.chirp_duration_1 * 1e6, " us"),
-            ("Chirp Duration 2 (us):", "chirp_duration_2", 0.001, 10000, 3,
-             self._settings.chirp_duration_2 * 1e6, " us"),
-            ("Chirps per Position:", "chirps_per_position", 1, 1024, 0,
-             self._settings.chirps_per_position, ""),
-            ("Freq Min (MHz):", "freq_min", 0.1, 1000, 1,
-             self._settings.freq_min / 1e6, " MHz"),
-            ("Freq Max (MHz):", "freq_max", 0.1, 1000, 1,
-             self._settings.freq_max / 1e6, " MHz"),
-            ("PRF 1 (Hz):", "prf1", 100, 100000, 0,
-             self._settings.prf1, " Hz"),
-            ("PRF 2 (Hz):", "prf2", 100, 100000, 0,
-             self._settings.prf2, " Hz"),
-            ("Max Distance (km):", "max_distance", 1, 500, 1,
-             self._settings.max_distance / 1000, " km"),
-            ("Map Size (km):", "map_size", 1, 500, 1,
-             self._settings.map_size / 1000, " km"),
-        ]
-
-        for i, (label, key, lo, hi, dec, default, suffix) in enumerate(param_defs):
-            r_layout.addWidget(QLabel(label), i, 0)
-            if dec == 0:
-                spin = QSpinBox()
-                spin.setRange(int(lo), int(hi))
-                spin.setValue(int(default))
-                if suffix:
-                    spin.setSuffix(suffix)
-            else:
-                spin = QDoubleSpinBox()
-                spin.setRange(lo, hi)
-                spin.setDecimals(dec)
-                spin.setValue(default)
-                if suffix:
-                    spin.setSuffix(suffix)
-            r_layout.addWidget(spin, i, 1)
-            self._setting_spins[key] = spin
-
-        apply_btn = QPushButton("Apply Settings")
-        apply_btn.setStyleSheet(
-            f"QPushButton {{ background-color: {DARK_INFO}; color: white; font-weight: bold; }}"
-        )
-        apply_btn.clicked.connect(self._apply_settings)
-        r_layout.addWidget(apply_btn, len(param_defs), 0, 1, 2)
-
-        layout.addWidget(radar_group)
-
-        # ---- Signal Processing group ---------------------------------------
-        proc_group = QGroupBox("Signal Processing")
+        # ---- Host-side DSP group -------------------------------------------
+        proc_group = QGroupBox("Host-Side Signal Processing (post-FPGA)")
         p_layout = QGridLayout(proc_group)
         row = 0
 
-        # -- MTI --
-        self._mti_check = QCheckBox("MTI (Moving Target Indication)")
-        self._mti_check.setChecked(self._processing_config.mti_enabled)
-        p_layout.addWidget(self._mti_check, row, 0, 1, 2)
-        row += 1
-
-        p_layout.addWidget(QLabel("MTI Order:"), row, 0)
-        self._mti_order_spin = QSpinBox()
-        self._mti_order_spin.setRange(1, 3)
-        self._mti_order_spin.setValue(self._processing_config.mti_order)
-        self._mti_order_spin.setToolTip("1 = single canceller, 2 = double, 3 = triple")
-        p_layout.addWidget(self._mti_order_spin, row, 1)
-        row += 1
-
-        # -- Separator --
-        sep1 = QFrame()
-        sep1.setFrameShape(QFrame.Shape.HLine)
-        sep1.setStyleSheet(f"color: {DARK_BORDER};")
-        p_layout.addWidget(sep1, row, 0, 1, 2)
-        row += 1
-
-        # -- CFAR --
-        self._cfar_check = QCheckBox("CFAR (Constant False Alarm Rate)")
-        self._cfar_check.setChecked(self._processing_config.cfar_enabled)
-        p_layout.addWidget(self._cfar_check, row, 0, 1, 2)
-        row += 1
-
-        p_layout.addWidget(QLabel("CFAR Type:"), row, 0)
-        self._cfar_type_combo = QComboBox()
-        self._cfar_type_combo.addItems(["CA-CFAR", "OS-CFAR", "GO-CFAR", "SO-CFAR"])
-        self._cfar_type_combo.setCurrentText(self._processing_config.cfar_type)
-        p_layout.addWidget(self._cfar_type_combo, row, 1)
-        row += 1
-
-        p_layout.addWidget(QLabel("Guard Cells:"), row, 0)
-        self._cfar_guard_spin = QSpinBox()
-        self._cfar_guard_spin.setRange(1, 20)
-        self._cfar_guard_spin.setValue(self._processing_config.cfar_guard_cells)
-        p_layout.addWidget(self._cfar_guard_spin, row, 1)
-        row += 1
-
-        p_layout.addWidget(QLabel("Training Cells:"), row, 0)
-        self._cfar_train_spin = QSpinBox()
-        self._cfar_train_spin.setRange(1, 50)
-        self._cfar_train_spin.setValue(self._processing_config.cfar_training_cells)
-        p_layout.addWidget(self._cfar_train_spin, row, 1)
-        row += 1
-
-        p_layout.addWidget(QLabel("Threshold Factor:"), row, 0)
-        self._cfar_thresh_spin = QDoubleSpinBox()
-        self._cfar_thresh_spin.setRange(0.1, 50.0)
-        self._cfar_thresh_spin.setDecimals(1)
-        self._cfar_thresh_spin.setValue(self._processing_config.cfar_threshold_factor)
-        self._cfar_thresh_spin.setSingleStep(0.5)
-        p_layout.addWidget(self._cfar_thresh_spin, row, 1)
-        row += 1
-
-        # -- Separator --
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"color: {DARK_BORDER};")
-        p_layout.addWidget(sep2, row, 0, 1, 2)
-        row += 1
-
-        # -- DC Notch --
-        self._dc_notch_check = QCheckBox("DC Notch / Zero-Doppler Removal")
-        self._dc_notch_check.setChecked(self._processing_config.dc_notch_enabled)
-        p_layout.addWidget(self._dc_notch_check, row, 0, 1, 2)
-        row += 1
-
-        # -- Separator --
-        sep3 = QFrame()
-        sep3.setFrameShape(QFrame.Shape.HLine)
-        sep3.setStyleSheet(f"color: {DARK_BORDER};")
-        p_layout.addWidget(sep3, row, 0, 1, 2)
-        row += 1
-
-        # -- Windowing --
-        p_layout.addWidget(QLabel("Window Function:"), row, 0)
-        self._window_combo = QComboBox()
-        self._window_combo.addItems(["None", "Hann", "Hamming", "Blackman", "Kaiser", "Chebyshev"])
-        self._window_combo.setCurrentText(self._processing_config.window_type)
-        if not SCIPY_AVAILABLE:
-            # Without scipy, only None/Hann/Hamming/Blackman via numpy
-            self._window_combo.setToolTip("Kaiser and Chebyshev require scipy")
-        p_layout.addWidget(self._window_combo, row, 1)
-        row += 1
-
-        # -- Separator --
-        sep4 = QFrame()
-        sep4.setFrameShape(QFrame.Shape.HLine)
-        sep4.setStyleSheet(f"color: {DARK_BORDER};")
-        p_layout.addWidget(sep4, row, 0, 1, 2)
-        row += 1
-
-        # -- Detection Threshold --
-        p_layout.addWidget(QLabel("Detection Threshold (dB):"), row, 0)
-        self._det_thresh_spin = QDoubleSpinBox()
-        self._det_thresh_spin.setRange(0.0, 60.0)
-        self._det_thresh_spin.setDecimals(1)
-        self._det_thresh_spin.setValue(self._processing_config.detection_threshold_db)
-        self._det_thresh_spin.setSuffix(" dB")
-        self._det_thresh_spin.setSingleStep(1.0)
-        self._det_thresh_spin.setToolTip(
-            "SNR threshold above noise floor (used when CFAR is disabled)"
+        note = QLabel(
+            "These settings control host-side DSP that runs AFTER the FPGA "
+            "processing pipeline. FPGA-side MTI, CFAR, and DC notch are "
+            "controlled from the FPGA Control tab."
         )
-        p_layout.addWidget(self._det_thresh_spin, row, 1)
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {DARK_WARNING}; padding: 6px;")
+        p_layout.addWidget(note, row, 0, 1, 2)
         row += 1
 
-        # -- Separator --
-        sep5 = QFrame()
-        sep5.setFrameShape(QFrame.Shape.HLine)
-        sep5.setStyleSheet(f"color: {DARK_BORDER};")
-        p_layout.addWidget(sep5, row, 0, 1, 2)
-        row += 1
-
-        # -- Clustering --
+        # Clustering
         self._cluster_check = QCheckBox("DBSCAN Clustering")
         self._cluster_check.setChecked(self._processing_config.clustering_enabled)
         if not SKLEARN_AVAILABLE:
@@ -793,14 +891,14 @@ class RadarDashboard(QMainWindow):
         p_layout.addWidget(self._cluster_min_spin, row, 1)
         row += 1
 
-        # -- Separator --
-        sep6 = QFrame()
-        sep6.setFrameShape(QFrame.Shape.HLine)
-        sep6.setStyleSheet(f"color: {DARK_BORDER};")
-        p_layout.addWidget(sep6, row, 0, 1, 2)
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {DARK_BORDER};")
+        p_layout.addWidget(sep, row, 0, 1, 2)
         row += 1
 
-        # -- Kalman Tracking --
+        # Kalman Tracking
         self._tracking_check = QCheckBox("Kalman Tracking")
         self._tracking_check.setChecked(self._processing_config.tracking_enabled)
         if not FILTERPY_AVAILABLE:
@@ -809,8 +907,8 @@ class RadarDashboard(QMainWindow):
         p_layout.addWidget(self._tracking_check, row, 0, 1, 2)
         row += 1
 
-        # Apply Processing button
-        apply_proc_btn = QPushButton("Apply Processing Settings")
+        # Apply
+        apply_proc_btn = QPushButton("Apply Host DSP Settings")
         apply_proc_btn.setStyleSheet(
             f"QPushButton {{ background-color: {DARK_SUCCESS}; color: white; font-weight: bold; }}"
             f"QPushButton:hover {{ background-color: #66BB6A; }}"
@@ -824,12 +922,13 @@ class RadarDashboard(QMainWindow):
         about_group = QGroupBox("About")
         about_layout = QVBoxLayout(about_group)
         about_lbl = QLabel(
-            "<b>PLFM Radar System GUI V7</b><br>"
+            "<b>AERIS-10 Radar System V7</b><br>"
             "PyQt6 Edition with Embedded Leaflet Map<br><br>"
-            "<b>Data Interface:</b> FT2232HQ (USB 2.0)<br>"
+            "<b>Data Interface:</b> FT2232H USB 2.0 (production protocol)<br>"
+            "<b>FPGA Protocol:</b> 4-byte register commands, 0xAA/0xBB packets<br>"
             "<b>Map:</b> OpenStreetMap + Leaflet.js<br>"
             "<b>Framework:</b> PyQt6 + QWebEngine<br>"
-            "<b>Version:</b> 7.0.0"
+            "<b>Version:</b> 7.1.0 (production protocol)"
         )
         about_lbl.setStyleSheet(f"color: {DARK_TEXT}; padding: 12px;")
         about_layout.addWidget(about_lbl)
@@ -867,7 +966,7 @@ class RadarDashboard(QMainWindow):
     # =====================================================================
 
     def _refresh_devices(self):
-        # STM32
+        # STM32 GPS
         self._stm32_devices = self._stm32.list_devices()
         self._stm32_combo.clear()
         for d in self._stm32_devices:
@@ -875,84 +974,121 @@ class RadarDashboard(QMainWindow):
         if self._stm32_devices:
             self._stm32_combo.setCurrentIndex(0)
 
-        # FT2232HQ (primary)
-        self._ft2232hq_devices = self._ft2232hq.list_devices()
-        self._ft2232hq_combo.clear()
-        for d in self._ft2232hq_devices:
-            self._ft2232hq_combo.addItem(d["description"])
-        if self._ft2232hq_devices:
-            self._ft2232hq_combo.setCurrentIndex(0)
+        logger.info(f"Devices refreshed: {len(self._stm32_devices)} STM32")
 
-        logger.info(
-            f"Devices refreshed: {len(self._stm32_devices)} STM32, "
-            f"{len(self._ft2232hq_devices)} FT2232HQ"
-        )
+    # =====================================================================
+    # FPGA command sending
+    # =====================================================================
+
+    def _send_fpga_cmd(self, opcode: int, value: int):
+        """Send a 4-byte register command to the FPGA via FT2232H."""
+        if self._connection is None or not self._connection.is_open:
+            logger.warning(f"Cannot send 0x{opcode:02X}={value}: no connection")
+            return
+        cmd = RadarProtocol.build_command(opcode, value)
+        ok = self._connection.write(cmd)
+        if ok:
+            logger.info(f"Sent FPGA cmd: 0x{opcode:02X} = {value}")
+        else:
+            logger.error(f"Failed to send FPGA cmd: 0x{opcode:02X}")
+
+    def _send_fpga_validated(self, opcode: int, value: int, bits: int):
+        """Clamp value to bit-width and send."""
+        max_val = (1 << bits) - 1
+        clamped = max(0, min(value, max_val))
+        if clamped != value:
+            logger.warning(f"Value {value} clamped to {clamped} "
+                           f"({bits}-bit max={max_val}) for opcode 0x{opcode:02X}")
+            # Update the spinbox
+            key = f"0x{opcode:02X}"
+            if key in self._param_spins:
+                self._param_spins[key].setValue(clamped)
+        self._send_fpga_cmd(opcode, clamped)
+
+    def _send_custom_command(self):
+        """Send custom opcode + value from the FPGA Control tab."""
+        try:
+            opcode = int(self._custom_opcode.text(), 16)
+            value = int(self._custom_value.text())
+            self._send_fpga_cmd(opcode, value)
+        except ValueError:
+            logger.error("Invalid custom command: check opcode (hex) and value (dec)")
 
     # =====================================================================
     # Start / Stop radar
     # =====================================================================
 
     def _start_radar(self):
+        """Start radar data acquisition using production protocol."""
         try:
-            # Open STM32
-            idx = self._stm32_combo.currentIndex()
-            if idx < 0 or idx >= len(self._stm32_devices):
-                QMessageBox.warning(self, "Warning", "Please select an STM32 USB device.")
-                return
-            if not self._stm32.open_device(self._stm32_devices[idx]):
-                QMessageBox.critical(self, "Error", "Failed to open STM32 USB device.")
+            mode = self._mode_combo.currentText()
+
+            if "Mock" in mode:
+                self._connection = FT2232HConnection(mock=True)
+                if not self._connection.open():
+                    QMessageBox.critical(self, "Error", "Failed to open mock connection.")
+                    return
+            elif "Live" in mode:
+                self._connection = FT2232HConnection(mock=False)
+                if not self._connection.open():
+                    QMessageBox.critical(self, "Error",
+                                         "Failed to open FT2232H. Check USB connection.")
+                    return
+            elif "Replay" in mode:
+                from PyQt6.QtWidgets import QFileDialog
+                npy_dir = QFileDialog.getExistingDirectory(
+                    self, "Select .npy replay directory")
+                if not npy_dir:
+                    return
+                self._connection = ReplayConnection(npy_dir)
+                if not self._connection.open():
+                    QMessageBox.critical(self, "Error",
+                                         "Failed to open replay connection.")
+                    return
+            else:
+                QMessageBox.warning(self, "Warning", "Unknown connection mode.")
                 return
 
-            # Open FT2232HQ (primary)
-            idx2 = self._ft2232hq_combo.currentIndex()
-            if idx2 >= 0 and idx2 < len(self._ft2232hq_devices):
-                url = self._ft2232hq_devices[idx2]["url"]
-                if not self._ft2232hq.open_device(url):
-                    QMessageBox.warning(
-                        self,
-                        "Warning",
-                        "Failed to open FT2232HQ device. Radar data may not be available.",
-                    )
-
-            # Send start flag + settings
-            if not self._stm32.send_start_flag():
-                QMessageBox.critical(self, "Error", "Failed to send start flag to STM32.")
-                return
-            self._apply_settings_to_model()
-            self._stm32.send_settings(self._settings)
-
-            # Start workers
+            # Start radar worker
             self._radar_worker = RadarDataWorker(
-                ft2232hq=self._ft2232hq,
+                connection=self._connection,
                 processor=self._processor,
-                packet_parser=self._radar_parser,
-                settings=self._settings,
+                recorder=self._recorder if self._recorder.recording else None,
                 gps_data_ref=self._radar_position,
+                settings=self._settings,
             )
+            self._radar_worker.frameReady.connect(self._on_frame_ready)
+            self._radar_worker.statusReceived.connect(self._on_status_received)
             self._radar_worker.targetsUpdated.connect(self._on_radar_targets)
             self._radar_worker.statsUpdated.connect(self._on_radar_stats)
             self._radar_worker.errorOccurred.connect(self._on_worker_error)
             self._radar_worker.start()
 
-            self._gps_worker = GPSDataWorker(
-                stm32=self._stm32,
-                usb_parser=self._usb_parser,
-            )
-            self._gps_worker.gpsReceived.connect(self._on_gps_received)
-            self._gps_worker.errorOccurred.connect(self._on_worker_error)
-            self._gps_worker.start()
+            # Optionally start GPS worker
+            idx = self._stm32_combo.currentIndex()
+            if (idx >= 0 and idx < len(self._stm32_devices)
+                    and self._stm32.open_device(self._stm32_devices[idx])):
+                self._gps_worker = GPSDataWorker(
+                    stm32=self._stm32,
+                    usb_parser=self._usb_parser,
+                )
+                self._gps_worker.gpsReceived.connect(self._on_gps_received)
+                self._gps_worker.errorOccurred.connect(self._on_worker_error)
+                self._gps_worker.start()
 
             # UI state
             self._running = True
             self._start_time = time.time()
+            self._frame_count = 0
             self._start_btn.setEnabled(False)
             self._stop_btn.setEnabled(True)
-            self._status_label_main.setText("Status: Radar running")
-            self._sb_status.setText("Radar running")
-            self._sb_mode.setText("Live")
-            logger.info("Radar system started")
+            self._mode_combo.setEnabled(False)
+            self._status_label_main.setText(f"Status: Running ({mode})")
+            self._sb_status.setText(f"Running ({mode})")
+            self._sb_mode.setText(mode)
+            logger.info(f"Radar started: {mode}")
 
-        except Exception as e:
+        except RuntimeError as e:
             QMessageBox.critical(self, "Error", f"Failed to start radar: {e}")
             logger.error(f"Start radar error: {e}")
 
@@ -969,11 +1105,15 @@ class RadarDashboard(QMainWindow):
             self._gps_worker.wait(2000)
             self._gps_worker = None
 
+        if self._connection:
+            self._connection.close()
+            self._connection = None
+
         self._stm32.close()
-        self._ft2232hq.close()
 
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+        self._mode_combo.setEnabled(True)
         self._status_label_main.setText("Status: Radar stopped")
         self._sb_status.setText("Radar stopped")
         self._sb_mode.setText("Idle")
@@ -1030,6 +1170,18 @@ class RadarDashboard(QMainWindow):
     # Slots — data from workers / simulator
     # =====================================================================
 
+    @pyqtSlot(object)
+    def _on_frame_ready(self, frame: RadarFrame):
+        """Handle a complete 64x32 radar frame from production acquisition."""
+        self._current_frame = frame
+        self._frame_count += 1
+
+    @pyqtSlot(object)
+    def _on_status_received(self, status: StatusResponse):
+        """Handle FPGA status readback."""
+        self._last_status = status
+        self._update_status_display(status)
+
     @pyqtSlot(list)
     def _on_radar_targets(self, targets: list):
         self._current_targets = targets
@@ -1037,7 +1189,7 @@ class RadarDashboard(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_radar_stats(self, stats: dict):
-        self._radar_stats = stats
+        pass  # Stats are displayed in _refresh_gui
 
     @pyqtSlot(str)
     def _on_worker_error(self, msg: str):
@@ -1088,6 +1240,43 @@ class RadarDashboard(QMainWindow):
         self._target_info_label.setText(info)
 
     # =====================================================================
+    # FPGA Status display
+    # =====================================================================
+
+    def _update_status_display(self, st: StatusResponse):
+        """Update FPGA status readback labels."""
+        # Diagnostics tab
+        lines = [
+            f"Mode: {st.radar_mode}  Stream: {st.stream_ctrl:03b}  "
+            f"Thresh: {st.cfar_threshold}",
+            f"Long Chirp: {st.long_chirp}  Listen: {st.long_listen}",
+            f"Guard: {st.guard}  Short Chirp: {st.short_chirp}  "
+            f"Listen: {st.short_listen}",
+            f"Chirps/Elev: {st.chirps_per_elev}  Range Mode: {st.range_mode}",
+        ]
+        self._fpga_status_label.setText("\n".join(lines))
+
+        # Self-test labels
+        if st.self_test_busy or st.self_test_flags:
+            flags = st.self_test_flags
+            self._st_labels["busy"].setText(
+                f"Busy: {'YES' if st.self_test_busy else 'no'}")
+            self._st_labels["flags"].setText(
+                f"Flags: {flags:05b}")
+            self._st_labels["detail"].setText(
+                f"Detail: 0x{st.self_test_detail:02X}")
+            self._st_labels["t0"].setText(
+                f"T0 BRAM: {'PASS' if flags & 0x01 else 'FAIL'}")
+            self._st_labels["t1"].setText(
+                f"T1 CIC:  {'PASS' if flags & 0x02 else 'FAIL'}")
+            self._st_labels["t2"].setText(
+                f"T2 FFT:  {'PASS' if flags & 0x04 else 'FAIL'}")
+            self._st_labels["t3"].setText(
+                f"T3 Arith: {'PASS' if flags & 0x08 else 'FAIL'}")
+            self._st_labels["t4"].setText(
+                f"T4 ADC:  {'PASS' if flags & 0x10 else 'FAIL'}")
+
+    # =====================================================================
     # Position / coverage callbacks (map sidebar)
     # =====================================================================
 
@@ -1108,46 +1297,10 @@ class RadarDashboard(QMainWindow):
     # Settings
     # =====================================================================
 
-    def _apply_settings_to_model(self):
-        """Read spin values into the RadarSettings model."""
-        s = self._settings
-        sp = self._setting_spins
-        s.system_frequency = sp["system_frequency"].value() * 1e9
-        s.chirp_duration_1 = sp["chirp_duration_1"].value() * 1e-6
-        s.chirp_duration_2 = sp["chirp_duration_2"].value() * 1e-6
-        s.chirps_per_position = int(sp["chirps_per_position"].value())
-        s.freq_min = sp["freq_min"].value() * 1e6
-        s.freq_max = sp["freq_max"].value() * 1e6
-        s.prf1 = sp["prf1"].value()
-        s.prf2 = sp["prf2"].value()
-        s.max_distance = sp["max_distance"].value() * 1000
-        s.map_size = sp["map_size"].value() * 1000
-
-    def _apply_settings(self):
-        try:
-            self._apply_settings_to_model()
-            if self._stm32.is_open:
-                self._stm32.send_settings(self._settings)
-            logger.info("Radar settings applied")
-            QMessageBox.information(self, "Settings", "Radar settings applied.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Invalid setting value: {e}")
-            logger.error(f"Settings error: {e}")
-
     def _apply_processing_config(self):
-        """Read signal processing controls into ProcessingConfig and push to processor."""
+        """Read host-side DSP controls into ProcessingConfig."""
         try:
             cfg = ProcessingConfig(
-                mti_enabled=self._mti_check.isChecked(),
-                mti_order=self._mti_order_spin.value(),
-                cfar_enabled=self._cfar_check.isChecked(),
-                cfar_type=self._cfar_type_combo.currentText(),
-                cfar_guard_cells=self._cfar_guard_spin.value(),
-                cfar_training_cells=self._cfar_train_spin.value(),
-                cfar_threshold_factor=self._cfar_thresh_spin.value(),
-                dc_notch_enabled=self._dc_notch_check.isChecked(),
-                window_type=self._window_combo.currentText(),
-                detection_threshold_db=self._det_thresh_spin.value(),
                 clustering_enabled=self._cluster_check.isChecked(),
                 clustering_eps=self._cluster_eps_spin.value(),
                 clustering_min_samples=self._cluster_min_spin.value(),
@@ -1156,15 +1309,14 @@ class RadarDashboard(QMainWindow):
             self._processing_config = cfg
             self._processor.set_config(cfg)
             logger.info(
-                f"Processing config applied: MTI={cfg.mti_enabled}(order {cfg.mti_order}), "
-                f"CFAR={cfg.cfar_enabled}({cfg.cfar_type}), DC_Notch={cfg.dc_notch_enabled}, "
-                f"Window={cfg.window_type}, Threshold={cfg.detection_threshold_db} dB, "
-                f"Clustering={cfg.clustering_enabled}, Tracking={cfg.tracking_enabled}"
+                f"Host DSP config: Clustering={cfg.clustering_enabled}, "
+                f"Tracking={cfg.tracking_enabled}"
             )
-            QMessageBox.information(self, "Processing", "Signal processing settings applied.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to apply processing settings: {e}")
-            logger.error(f"Processing config error: {e}")
+            QMessageBox.information(self, "Settings", "Host DSP settings applied.")
+        except RuntimeError as e:
+            QMessageBox.critical(self, "Error",
+                                 f"Failed to apply DSP settings: {e}")
+            logger.error(f"DSP config error: {e}")
 
     # =====================================================================
     # Periodic GUI refresh (100 ms timer)
@@ -1183,23 +1335,32 @@ class RadarDashboard(QMainWindow):
             pitch_text = f"Pitch: {gps.pitch:+.1f}\u00b0"
             self._pitch_label.setText(pitch_text)
             if abs(gps.pitch) > 10:
-                self._pitch_label.setStyleSheet(f"color: {DARK_ERROR}; font-weight: bold;")
+                self._pitch_label.setStyleSheet(
+                    f"color: {DARK_ERROR}; font-weight: bold;")
             elif abs(gps.pitch) > 5:
-                self._pitch_label.setStyleSheet(f"color: {DARK_WARNING}; font-weight: bold;")
+                self._pitch_label.setStyleSheet(
+                    f"color: {DARK_WARNING}; font-weight: bold;")
             else:
-                self._pitch_label.setStyleSheet(f"color: {DARK_SUCCESS}; font-weight: bold;")
+                self._pitch_label.setStyleSheet(
+                    f"color: {DARK_SUCCESS}; font-weight: bold;")
 
-            # Range-Doppler map
-            self._rdm_canvas.update_map(self._processor.range_doppler_map)
+            # Range-Doppler map from current frame
+            if self._current_frame is not None:
+                self._rdm_canvas.update_map(
+                    self._current_frame.magnitude,
+                    self._current_frame.detections,
+                )
 
             # Targets table (main tab)
             self._update_main_targets_table()
 
             # Status label (main tab)
             if self._running:
-                pkt = self._radar_stats.get("packets", 0)
+                det = (self._current_frame.detection_count
+                       if self._current_frame else 0)
                 self._status_label_main.setText(
-                    f"Status: Running \u2014 Packets: {pkt} \u2014 Pitch: {gps.pitch:+.1f}\u00b0"
+                    f"Status: Running \u2014 Frames: {self._frame_count} "
+                    f"\u2014 Detections: {det}"
                 )
 
             # Diagnostics values
@@ -1208,7 +1369,7 @@ class RadarDashboard(QMainWindow):
             # Status-bar target count
             self._sb_targets.setText(f"Targets: {len(self._current_targets)}")
 
-        except Exception as e:
+        except (RuntimeError, ValueError, IndexError) as e:
             logger.error(f"GUI refresh error: {e}")
 
     def _update_main_targets_table(self):
@@ -1217,58 +1378,42 @@ class RadarDashboard(QMainWindow):
 
         for row, t in enumerate(targets):
             self._targets_table_main.setItem(
-                row, 0, QTableWidgetItem(str(t.track_id)))
+                row, 0, QTableWidgetItem(f"{t.range:.0f}"))
             self._targets_table_main.setItem(
-                row, 1, QTableWidgetItem(f"{t.range:.1f}"))
+                row, 1, QTableWidgetItem(f"{t.velocity:.0f}"))
 
-            vel_item = QTableWidgetItem(f"{t.velocity:+.1f}")
-            if t.velocity > 1:
-                vel_item.setForeground(QColor(DARK_ERROR))
-            elif t.velocity < -1:
-                vel_item.setForeground(QColor(DARK_INFO))
-            self._targets_table_main.setItem(row, 2, vel_item)
-
+            mag_val = 10 ** (t.snr / 10) if t.snr > 0 else 0
             self._targets_table_main.setItem(
-                row, 3, QTableWidgetItem(f"{t.azimuth:.1f}"))
-
-            # Raw elevation — show stored value from corrections cache
-            raw_text = "N/A"
-            for corr in self._corrected_elevations[-20:]:
-                if abs(corr["corrected"] - t.elevation) < 0.1:
-                    raw_text = f"{corr['raw']}"
-                    break
+                row, 2, QTableWidgetItem(f"{mag_val:.0f}"))
             self._targets_table_main.setItem(
-                row, 4, QTableWidgetItem(raw_text))
+                row, 3, QTableWidgetItem(f"{t.snr:.1f}"))
             self._targets_table_main.setItem(
-                row, 5, QTableWidgetItem(f"{t.elevation:.1f}"))
-            self._targets_table_main.setItem(
-                row, 6, QTableWidgetItem(f"{t.snr:.1f}"))
+                row, 4, QTableWidgetItem(str(t.track_id)))
 
     def _update_diagnostics(self):
         # Connection indicators
+        conn_open = (self._connection is not None and self._connection.is_open)
+        self._set_conn_indicator(self._conn_ft2232h, conn_open)
         self._set_conn_indicator(self._conn_stm32, self._stm32.is_open)
-        self._set_conn_indicator(self._conn_ft2232hq, self._ft2232hq.is_open)
 
-        stats = self._radar_stats
         gps_count = self._gps_packet_count
         if self._gps_worker:
             gps_count = self._gps_worker.gps_count
 
         uptime = time.time() - self._start_time
-        pkt = stats.get("packets", 0)
-        pkt_rate = pkt / max(uptime, 1)
+        frame_rate = self._frame_count / max(uptime, 1)
+        det = (self._current_frame.detection_count
+               if self._current_frame else 0)
 
         vals = [
-            str(pkt),
-            f"{stats.get('bytes', 0):,}",
+            str(self._frame_count),
+            str(det),
             str(gps_count),
-            str(stats.get("errors", 0)),
-            str(stats.get("active_tracks", len(self._processor.tracks))),
-            str(stats.get("targets", len(self._current_targets))),
+            "0",  # errors
             f"{uptime:.0f}s",
-            f"{pkt_rate:.1f}/s",
+            f"{frame_rate:.1f}/s",
         ]
-        for lbl, v in zip(self._diag_values, vals):
+        for lbl, v in zip(self._diag_values, vals, strict=False):
             lbl.setText(v)
 
     # =====================================================================
@@ -1276,7 +1421,7 @@ class RadarDashboard(QMainWindow):
     # =====================================================================
 
     @staticmethod
-    def _make_status_label(name: str) -> QLabel:
+    def _make_status_label(_name: str) -> QLabel:
         lbl = QLabel("Disconnected")
         lbl.setStyleSheet(f"color: {DARK_ERROR}; font-weight: bold;")
         return lbl
@@ -1307,14 +1452,15 @@ class RadarDashboard(QMainWindow):
         if self._gps_worker:
             self._gps_worker.stop()
             self._gps_worker.wait(1000)
+        if self._connection:
+            self._connection.close()
         self._stm32.close()
-        self._ft2232hq.close()
         logging.getLogger().removeHandler(self._log_handler)
         event.accept()
 
 
 # =============================================================================
-# Qt-compatible log handler (routes Python logging → QTextEdit)
+# Qt-compatible log handler (routes Python logging -> QTextEdit)
 # =============================================================================
 
 class _QtLogHandler(logging.Handler):
@@ -1332,5 +1478,5 @@ class _QtLogHandler(logging.Handler):
         try:
             msg = self.format(record)
             self._callback(msg)
-        except Exception:
+        except RuntimeError:
             pass
